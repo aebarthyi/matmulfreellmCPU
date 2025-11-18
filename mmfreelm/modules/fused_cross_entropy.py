@@ -181,26 +181,25 @@ class CrossEntropyLossFunction(torch.autograd.Function):
         z_losses = torch.empty(*loss_shape, dtype=torch.float, device=logits.device)
         # Need this, otherwise Triton tries to launch from cuda:0 and we get
         # ValueError: Pointer argument (at 0) cannot be accessed from Triton (cpu tensor?)
-        with torch.cuda.device(logits.device.index):
-            cross_entropy_fwd_kernel[(n_rows, n_splits)](
-                losses,  # data ptrs
-                lse,
-                z_losses,
-                logits,
-                labels,
-                smoothing,
-                logit_scale,
-                lse_square_scale,
-                ignored_index,
-                total_classes,
-                class_start_idx,
-                n_cols,  # shapes
-                n_rows,
-                logits.stride(0),  # strides
-                BLOCK_SIZE=BLOCK_SIZE,  # constants
-                num_warps=num_warps,
-                SPLIT=split,
-            )
+        cross_entropy_fwd_kernel[(n_rows, n_splits)](
+            losses,  # data ptrs
+            lse,
+            z_losses,
+            logits,
+            labels,
+            smoothing,
+            logit_scale,
+            lse_square_scale,
+            ignored_index,
+            total_classes,
+            class_start_idx,
+            n_cols,  # shapes
+            n_rows,
+            logits.stride(0),  # strides
+            BLOCK_SIZE=BLOCK_SIZE,  # constants
+            num_warps=num_warps,
+            SPLIT=split,
+        )
 
         if split:
             # If there's no smoothing, if labels are in the vocab of this partition, losses contains
@@ -258,26 +257,25 @@ class CrossEntropyLossFunction(torch.autograd.Function):
         def grid(META): return (n_rows, triton.cdiv(n_cols, META["BLOCK_SIZE"]))  # noqa
         # Need this, otherwise Triton tries to launch from cuda:0 and we get
         # ValueError: Pointer argument (at 0) cannot be accessed from Triton (cpu tensor?)
-        with torch.cuda.device(logits.device.index):
-            cross_entropy_bwd_kernel[grid](
-                dlogits,  # data ptrs
-                grad_losses,
-                logits,
-                lse,
-                labels,
-                ctx.smoothing,
-                ctx.logit_scale,
-                ctx.lse_square_scale,
-                ctx.ignored_index,
-                ctx.total_classes,
-                ctx.class_start_idx,
-                n_cols,  # shapes
-                logits.stride(0),  # strides
-                dlogits.stride(0),
-                grad_losses.stride(0),
-                BLOCK_SIZE=BLOCK_SIZE,  # constants
-                num_warps=num_warps,
-            )
+        cross_entropy_bwd_kernel[grid](
+            dlogits,  # data ptrs
+            grad_losses,
+            logits,
+            lse,
+            labels,
+            ctx.smoothing,
+            ctx.logit_scale,
+            ctx.lse_square_scale,
+            ctx.ignored_index,
+            ctx.total_classes,
+            ctx.class_start_idx,
+            n_cols,  # shapes
+            logits.stride(0),  # strides
+            dlogits.stride(0),
+            grad_losses.stride(0),
+            BLOCK_SIZE=BLOCK_SIZE,  # constants
+            num_warps=num_warps,
+        )
         return dlogits, None, None, None, None, None, None, None, None
 
 
@@ -367,7 +365,6 @@ class FusedCrossEntropyLoss(nn.Module):
             losses: (batch,) if reduction is 'none', else (1,), dtype float
             z_loss: (batch,) if reduction is 'none', else (1,), dtype float (if self.return_z_loss)
         """
-        assert input.is_cuda and target.is_cuda, "Only support CUDA tensors"
         loss, z_loss = cross_entropy_loss(
             input,
             target,

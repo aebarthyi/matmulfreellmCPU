@@ -108,36 +108,24 @@ def sqrelu_fwd(x):
 
 
 @torch.jit.script
-def sqrelu_bwd(g, x):
-    return (2.0 * g * F.relu(x)).to(dtype=x.dtype)
+def swiglu_fwd(x, y):
+    return F.silu(x) * y
 
 
-swiglu_fwd_codestring = """
-template <typename T> T swiglu_fwd(T x, T y) {
-    return float(x) * float(y) / (1.0f + ::exp(-float(x)));
-}
-"""
-swiglu_bwd_codestring = """
-template <typename T> T swiglu_bwd(T x, T y, T g, T& dx, T& dy) {
-    float x_sigmoid = 1.0f / (1.0f + ::exp(-float(x)));
-    dx = x_sigmoid * (1 + float(x) * (1.0f - x_sigmoid)) * float(g) * float(y);
-    dy = float(x) * x_sigmoid * float(g);
-}
-"""
+@torch.jit.script
+def swiglu_bwd(x, y, g, dx, dy):
+    x_sigmoid = 1.0 / (1.0 + torch.exp(-x))
+    dx = x_sigmoid * (1 + x * (1.0 - x_sigmoid)) * g * y
+    dy = x * x_sigmoid * g
 
-swiglu_bwd_with_output_codestring = """
-template <typename T> T swiglu_bwd_with_output(T x, T y, T g, T& dx, T& dy, T& z) {
-    float x_sigmoid = 1.0f / (1.0f + ::exp(-float(x)));
-    float x_swish = float(x) * x_sigmoid;
-    dx = x_sigmoid * (1 + float(x) * (1.0f - x_sigmoid)) * float(g) * float(y);
-    dy = x_swish * float(g);
-    z = x_swish * float(y);
-}
-"""
 
-swiglu_fwd = torch.cuda.jiterator._create_jit_fn(swiglu_fwd_codestring)
-swiglu_bwd = torch.cuda.jiterator._create_multi_output_jit_fn(swiglu_bwd_codestring, num_outputs=2)
-swiglu_bwd_with_output = torch.cuda.jiterator._create_multi_output_jit_fn(swiglu_bwd_with_output_codestring, num_outputs=3)
+@torch.jit.script
+def swiglu_bwd_with_output(x, y, g, dx, dy, z):
+    x_sigmoid = 1.0 / (1.0 + torch.exp(-x))
+    x_swish = swish(x)
+    dx = x_sigmoid * (1 + x * (1.0 - x_sigmoid)) * g * y
+    dy = x_swish * g
+    z = x_swish * y
 
 
 class SwiGLUFunction(torch.autograd.Function):

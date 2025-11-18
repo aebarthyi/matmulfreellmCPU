@@ -1,0 +1,4 @@
+mmfreelm/__pycache__
+mmfreelm/*/__pycache__
+mmfreelm/*/*/__pycache__
+*.json

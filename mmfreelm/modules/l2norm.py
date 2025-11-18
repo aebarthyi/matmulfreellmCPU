@@ -117,19 +117,18 @@ def _l2_norm_fwd(
         raise RuntimeError(
             "This layer norm doesn't support feature dim >= 64KB.")
     # heuristics for number of warps
-    with torch.cuda.device(x.device.index):
-        _l2_norm_fwd_1pass_kernel[(M,)](
-            x,
-            y,
-            x.stride(0),
-            N,
-            eps,
-            # is_rms_norm,
-            BLOCK_N,
-            # residual is not None,
-            # residual_out is not None,
-            # bias is not None,
-        )
+    _l2_norm_fwd_1pass_kernel[(M,)](
+        x,
+        y,
+        x.stride(0),
+        N,
+        eps,
+        # is_rms_norm,
+        BLOCK_N,
+        # residual is not None,
+        # residual_out is not None,
+        # bias is not None,
+    )
     return y.reshape(x_shape_og)
 
 def _l2_norm_bwd(
@@ -155,16 +154,15 @@ def _l2_norm_bwd(
         raise RuntimeError(
             "This layer norm doesn't support feature dim >= 64KB.")
     # heuristics for number of warps
-    with torch.cuda.device(x.device.index):
-        _l2_norm_bwd_kernel[(M,)](
-            x,
-            dy,
-            dx,
-            x.stride(0),
-            N,
-            eps,
-            BLOCK_N,
-        )
+    _l2_norm_bwd_kernel[(M,)](
+        x,
+        dy,
+        dx,
+        x.stride(0),
+        N,
+        eps,
+        BLOCK_N,
+    )
     return dx.reshape(x_shape_og)
 
 
@@ -199,7 +197,7 @@ class L2NormFN(torch.autograd.Function):
 l2_norm_fn = L2NormFN.apply
 
 if __name__ == '__main__':
-    x = torch.rand(10, 10, 100).cuda().requires_grad_(True)
+    x = torch.rand(10, 10, 100).requires_grad_(True)
     y = torch.nn.functional.normalize(x, dim=-1, p=2)
     dy = torch.rand_like(y)
     y.backward(dy, retain_graph=True)
