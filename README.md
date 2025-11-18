@@ -24,11 +24,24 @@ We evaluate how the scaling law fits to the 370M, 1.3B and 2.7B parameter models
 
 The following requirements should be satisfied 
 - [PyTorch](https://pytorch.org/) >= 2.0
-- [Triton](https://github.com/openai/triton) >=2.2
 - [einops](https://einops.rocks/)
-
+- build-essentials and libpython3-dev (for building triton-cpu)
+```sh
+sudo apt install build-essentials libpython3-dev 
+```
 ```sh
 pip install -U git+https://github.com/ridgerchu/matmulfreellm
+```
+# Installing triton-cpu
+```sh
+git submodule init --recursive
+git submodule update
+cd triton-cpu
+python3 -m venv ./venv
+source venv/bin/activate
+pip3 install -r python/requirements.txt
+MAX_JOBS=4 pip3 install -e python
+pip3 show triton
 ```
 
 # Usage
@@ -98,6 +111,11 @@ HGRNBitModel(
 
 Upon successfully pretraining a model, it becomes accessible for generating text using the 🤗 text generation APIs.
 In the following, we give a generation example in `generate.py`:
+
+Make sure to set TRITON_CPU_BACKEND to 1 to use only the CPU
+```sh
+TRITON_CPU_BACKEND=1 python3 generate.py
+```
 
 ```py
 import os
