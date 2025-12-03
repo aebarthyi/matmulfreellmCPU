@@ -30,6 +30,8 @@ The following requirements should be satisfied
 sudo apt install build-essentials libpython3-dev 
 ```
 ```sh
+pip install accelerate
+pip install --upgrade transformers==4.49.0
 pip install -U git+https://github.com/ridgerchu/matmulfreellm
 ```
 # Installing triton-cpu
