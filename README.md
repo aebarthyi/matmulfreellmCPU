@@ -27,7 +27,7 @@ The following requirements should be satisfied
 - [einops](https://einops.rocks/)
 - build-essentials and libpython3-dev (for building triton-cpu)
 ```sh
-sudo apt install build-essentials libpython3-dev 
+sudo apt install build-essential libpython3-dev 
 ```
 ```sh
 pip install accelerate
