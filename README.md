@@ -36,8 +36,7 @@ pip install -U git+https://github.com/aebarthyi/matmulfreellmCPU
 ```
 # Installing triton-cpu
 ```sh
-git submodule init --recursive
-git submodule update
+git submodule update --init --recursive
 cd triton-cpu
 python3 -m venv ./venv
 source venv/bin/activate
