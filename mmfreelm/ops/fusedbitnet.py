@@ -428,6 +428,7 @@ class LayerNormLinearQuantFn(torch.autograd.Function):
         prenorm=False,
         residual_in_fp32=False,
         is_rms_norm=False,
+        weight_already_quantized=False
     ):
         x_shape_og = x.shape
         # reshape input data into 2D tensor
@@ -452,7 +453,8 @@ class LayerNormLinearQuantFn(torch.autograd.Function):
         )
         y = y.reshape(x_shape_og)
         dtype = torch.get_autocast_gpu_dtype() if torch.is_autocast_enabled() else y.dtype
-        linear_weight = weight_quant(linear_weight).to(dtype)
+        if not weight_already_quantized:
+            linear_weight = weight_quant(linear_weight).to(dtype)
         linear_bias = linear_bias.to(dtype) if linear_bias is not None else None
         out = F.linear(y.to(linear_weight.dtype), linear_weight, linear_bias)
         # We don't store y, will be recomputed in the backward pass to save memory
@@ -520,6 +522,7 @@ def layer_norm_linear_quant_fn(
     prenorm=False,
     residual_in_fp32=False,
     is_rms_norm=False,
+    weight_already_quantized=False
 ):
     return LayerNormLinearQuantFn.apply(
         x,
@@ -532,6 +535,7 @@ def layer_norm_linear_quant_fn(
         prenorm,
         residual_in_fp32,
         is_rms_norm,
+        weight_already_quantized
     )
 
 
@@ -597,6 +601,11 @@ class FusedBitLinear(BitLinear):
         """
         # Initialize the superclass nn.Linear with the given parameters
         super(FusedBitLinear, self).__init__(in_features, out_features, bias=bias)
+        self._inference_mode = False
+
+    def prepare_for_inference(self):
+        self.register_buffer('weight_q', weight_quant(self.weight))
+        self._inference_mode = True
 
     def forward(self, x):
         return layer_norm_linear_quant_fn(
@@ -605,5 +614,6 @@ class FusedBitLinear(BitLinear):
             self.norm.bias,
             self.weight,
             self.bias,
-            is_rms_norm=True
+            is_rms_norm=True,
+            weight_already_quantized=self._inference_mode
         )
