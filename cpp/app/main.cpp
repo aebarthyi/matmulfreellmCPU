@@ -27,11 +27,21 @@
 //   --print-ids        print the full id stream on stdout instead of decoded text
 //   --show-ids         also print prompt/gen ids to stderr
 //   --logits-out PATH  write last-position logits of the full stream as raw float32
+//
+// Benchmark mode (tok/s):
+//   --bench            time generation instead of printing text; reports prefill and
+//                      decode throughput. Uses greedy decode with EOS disabled so every
+//                      run produces exactly --gen tokens (stable, comparable timing).
+//   --warmup N         untimed warmup runs before measuring (default 1)
+//   --reps N           timed runs to average over            (default 3)
+// e.g.  mmfree-cli --bench --gen 128            # default prompt, 128 new tokens
+//       mmfree-cli --bench --gen 256 --reps 5 "Once upon a time,"
 #include "mmfree/model.hpp"
 #include "mmfree/tokenizer.hpp"
 #include "mmfree/weights.hpp"
 
 #include <cctype>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
@@ -41,6 +51,10 @@
 #include <random>
 #include <string>
 #include <vector>
+
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 
 using namespace mmfree;
 
@@ -70,8 +84,9 @@ int main(int argc, char** argv) {
   std::string blob = "model.mmfree", tokenizer_path, mode = "fixed", ids_arg, logits_out;
   std::string prompt, decode_arg;
   bool have_prompt = false, no_bos = false, no_eos = false, print_ids = false,
-       show_ids = false;
+       show_ids = false, bench = false;
   int frac = 10;
+  int bench_warmup = 1, bench_reps = 3;
   std::size_t gen = 32;
   Sampling samp;
   bool have_seed = false;
@@ -94,6 +109,9 @@ int main(int argc, char** argv) {
     else if (k == "--print-ids") print_ids = true;
     else if (k == "--show-ids") show_ids = true;
     else if (k == "--logits-out") logits_out = next();
+    else if (k == "--bench") bench = true;
+    else if (k == "--warmup") bench_warmup = std::atoi(next());
+    else if (k == "--reps") bench_reps = std::atoi(next());
     else if (!k.empty() && k[0] == '-') {
       std::fprintf(stderr, "unknown arg: %s\n", k.c_str());
       return 2;
@@ -124,11 +142,15 @@ int main(int argc, char** argv) {
   if (ids_mode) {
     ids = parse_ids(ids_arg);
   } else {
-    if (!have_prompt) {  // read prompt from stdin
-      std::string all, line;
-      while (std::getline(std::cin, line)) all += line + "\n";
-      while (!all.empty() && (all.back() == '\n' || all.back() == ' ')) all.pop_back();
-      prompt = all;
+    if (!have_prompt) {
+      if (bench) {  // standalone benchmark: use a fixed prompt instead of blocking on stdin
+        prompt = "The quick brown fox jumps over the lazy dog.";
+      } else {  // read prompt from stdin
+        std::string all, line;
+        while (std::getline(std::cin, line)) all += line + "\n";
+        while (!all.empty() && (all.back() == '\n' || all.back() == ' ')) all.pop_back();
+        prompt = all;
+      }
     }
     ids = tok->encode(prompt, !no_bos);
   }
@@ -142,9 +164,78 @@ int main(int argc, char** argv) {
   ActQuant aq = (mode == "fixed") ? ActQuant::FixedQ510 : ActQuant::Float;
   std::unique_ptr<Weights> w;
   std::unique_ptr<Model> model;
-  if (gen > 0 || !logits_out.empty()) {
+  if (gen > 0 || !logits_out.empty() || bench) {
     w = std::make_unique<Weights>(blob);
     model = std::make_unique<Model>(*w, aq, frac);
+  }
+
+  // ---- benchmark mode: time generation, report prefill/decode tok/s, then exit ----
+  if (bench) {
+    if (gen == 0) { std::fprintf(stderr, "--bench needs --gen > 0\n"); return 2; }
+    using clk = std::chrono::steady_clock;
+    auto secs = [](clk::duration d) {
+      return std::chrono::duration<double>(d).count();
+    };
+
+    // One timed generation. Greedy, EOS disabled -> always exactly `gen` tokens.
+    // The on_token callback timestamps the first emitted token (end of prefill) and the
+    // last, splitting prompt processing (prefill) from per-token decode.
+    struct RunStat { double prefill_s, decode_s, total_s; std::size_t gen_n; };
+    auto run_once = [&]() -> RunStat {
+      Sampling g;  // temperature 0 => greedy
+      clk::time_point t0 = clk::now(), t_first = t0, t_last = t0;
+      bool got_first = false;
+      std::size_t n = 0;
+      auto cb = [&](std::int64_t) {
+        clk::time_point now = clk::now();
+        if (!got_first) { t_first = now; got_first = true; }
+        t_last = now;
+        ++n;
+      };
+      model->generate(ids, gen, /*eos=*/-1, g, cb);
+      double prefill_s = secs(t_first - t0);
+      double decode_s = (n > 1) ? secs(t_last - t_first) : 0.0;
+      return {prefill_s, decode_s, secs(t_last - t0), n};
+    };
+
+    int threads = 1;
+#ifdef _OPENMP
+    threads = omp_get_max_threads();
+#endif
+    std::printf("mmfree-cli benchmark\n");
+    std::printf("  blob:          %s\n", blob.c_str());
+    std::printf("  mode:          %s (frac=%d)\n", mode.c_str(), frac);
+    std::printf("  threads:       %d\n", threads);
+    std::printf("  prompt tokens: %zu\n", ids.size());
+    std::printf("  gen tokens:    %zu\n", gen);
+    std::printf("  warmup/reps:   %d/%d\n\n", bench_warmup, bench_reps);
+
+    for (int i = 0; i < bench_warmup; ++i) run_once();
+
+    double sum_prefill = 0, sum_decode = 0, sum_total = 0, sum_dec_tps = 0;
+    for (int i = 0; i < bench_reps; ++i) {
+      RunStat s = run_once();
+      double dec_tps = (s.gen_n > 1 && s.decode_s > 0) ? (s.gen_n - 1) / s.decode_s : 0.0;
+      double overall_tps = (s.total_s > 0) ? s.gen_n / s.total_s : 0.0;
+      std::printf("  run %d: prefill %7.1f ms   decode %8.2f tok/s   overall %8.2f tok/s\n",
+                  i + 1, s.prefill_s * 1e3, dec_tps, overall_tps);
+      sum_prefill += s.prefill_s;
+      sum_decode += s.decode_s;
+      sum_total += s.total_s;
+      sum_dec_tps += dec_tps;
+    }
+    double n = bench_reps > 0 ? bench_reps : 1;
+    double avg_prefill = sum_prefill / n;
+    double avg_dec_tps = sum_dec_tps / n;
+    double avg_total = sum_total / n;
+    double prefill_tps = avg_prefill > 0 ? ids.size() / avg_prefill : 0.0;
+    double overall_tps = avg_total > 0 ? (gen / avg_total) : 0.0;
+    std::printf("\n  avg prefill: %7.1f ms  (%.2f tok/s over %zu prompt tokens)\n",
+                avg_prefill * 1e3, prefill_tps, ids.size());
+    std::printf("  avg decode:  %8.2f tok/s\n", avg_dec_tps);
+    std::printf("  avg overall: %8.2f tok/s  (%zu gen tokens / %.3f s)\n",
+                overall_tps, gen, avg_total);
+    return 0;
   }
 
   // Sampling: a random seed each run unless --seed pins it (greedy ignores the seed).
