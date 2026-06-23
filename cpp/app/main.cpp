@@ -34,9 +34,13 @@
 //                      run produces exactly --gen tokens (stable, comparable timing).
 //   --warmup N         untimed warmup runs before measuring (default 1)
 //   --reps N           timed runs to average over            (default 3)
+//   --profile          print a per-op wall-clock breakdown (matmul vs rmsnorm/scan/...),
+//                      so you can see what % of time the ternary matmul takes. Works on
+//                      its own (normal generation) or together with --bench.
 // e.g.  mmfree-cli --bench --gen 128            # default prompt, 128 new tokens
 //       mmfree-cli --bench --gen 256 --reps 5 "Once upon a time,"
 #include "mmfree/model.hpp"
+#include "mmfree/profile.hpp"
 #include "mmfree/tokenizer.hpp"
 #include "mmfree/weights.hpp"
 
@@ -73,6 +77,34 @@ static std::vector<std::int64_t> parse_ids(const std::string& s) {
   return ids;
 }
 
+// Print the accumulated per-op wall-clock breakdown to stdout. `runs` divides the totals
+// so the times read as "per generation" rather than summed over reps.
+static void print_profile(int runs) {
+  auto& prof = mmfree::Profiler::instance();
+  auto entries = prof.sorted();
+  double total_ms = prof.total_ns() / 1e6;
+  if (total_ms <= 0.0 || runs <= 0) {
+    std::printf("\nprofile: no samples\n");
+    return;
+  }
+  std::printf("\nop profile (%d run%s, instrumented ops only):\n", runs, runs == 1 ? "" : "s");
+  std::printf("  %-12s %10s %8s %10s %10s\n", "op", "ms/run", "%", "calls/run", "us/call");
+  double matmul_ms = 0.0;
+  for (const auto& e : entries) {
+    double ms = e.ns / 1e6;
+    double pct = 100.0 * ms / total_ms;
+    double per_run_ms = ms / runs;
+    double calls_per_run = static_cast<double>(e.count) / runs;
+    double us_per_call = e.count ? (e.ns / 1e3) / e.count : 0.0;
+    std::printf("  %-12s %10.2f %7.1f%% %10.1f %10.2f\n", e.label.c_str(), per_run_ms, pct,
+                calls_per_run, us_per_call);
+    if (e.label == "matmul" || e.label == "lm_head") matmul_ms += ms;
+  }
+  std::printf("  %-12s %10.2f %7.1f%%\n", "TOTAL", total_ms / runs, 100.0);
+  std::printf("\n  matmul (incl lm_head): %.1f%% of profiled time;  other ops: %.1f%%\n",
+              100.0 * matmul_ms / total_ms, 100.0 * (total_ms - matmul_ms) / total_ms);
+}
+
 // "<dir>/tokenizer.mmtok" alongside the weight blob.
 static std::string default_tokenizer_path(const std::string& blob) {
   std::size_t slash = blob.find_last_of('/');
@@ -84,7 +116,7 @@ int main(int argc, char** argv) {
   std::string blob = "model.mmfree", tokenizer_path, mode = "fixed", ids_arg, logits_out;
   std::string prompt, decode_arg;
   bool have_prompt = false, no_bos = false, no_eos = false, print_ids = false,
-       show_ids = false, bench = false;
+       show_ids = false, bench = false, profile = false;
   int frac = 10;
   int bench_warmup = 1, bench_reps = 3;
   std::size_t gen = 32;
@@ -112,6 +144,7 @@ int main(int argc, char** argv) {
     else if (k == "--bench") bench = true;
     else if (k == "--warmup") bench_warmup = std::atoi(next());
     else if (k == "--reps") bench_reps = std::atoi(next());
+    else if (k == "--profile") profile = true;
     else if (!k.empty() && k[0] == '-') {
       std::fprintf(stderr, "unknown arg: %s\n", k.c_str());
       return 2;
@@ -212,6 +245,10 @@ int main(int argc, char** argv) {
 
     for (int i = 0; i < bench_warmup; ++i) run_once();
 
+    // Profile only the timed reps (warmup excluded), so the breakdown lines up with the
+    // reported tok/s. Totals are divided by reps in print_profile -> "per generation".
+    if (profile) { Profiler::instance().reset(); Profiler::instance().enable(true); }
+
     double sum_prefill = 0, sum_decode = 0, sum_total = 0, sum_dec_tps = 0;
     for (int i = 0; i < bench_reps; ++i) {
       RunStat s = run_once();
@@ -235,6 +272,7 @@ int main(int argc, char** argv) {
     std::printf("  avg decode:  %8.2f tok/s\n", avg_dec_tps);
     std::printf("  avg overall: %8.2f tok/s  (%zu gen tokens / %.3f s)\n",
                 overall_tps, gen, avg_total);
+    if (profile) { Profiler::instance().enable(false); print_profile(bench_reps); }
     return 0;
   }
 
@@ -262,9 +300,11 @@ int main(int argc, char** argv) {
   }
 
   // Generate. EOS stop only in text mode (ids mode stays exactly --gen for comparison).
+  if (profile) { Profiler::instance().reset(); Profiler::instance().enable(true); }
   std::int64_t eos = (!ids_mode && !no_eos && tok) ? tok->eos_id() : -1;
   std::vector<std::int64_t> stream =
       (gen > 0) ? model->generate(ids, gen, eos, samp, on_token) : ids;
+  if (profile) Profiler::instance().enable(false);
   if (stream_text && gen > 0) std::fputc('\n', stdout);  // finish the streamed line
 
   if (!logits_out.empty()) {
@@ -296,5 +336,6 @@ int main(int argc, char** argv) {
     std::printf("%s\n", tok->decode(gen_ids).c_str());
   }
   // (text mode with gen > 0 was already streamed above)
+  if (profile && gen > 0) print_profile(1);
   return 0;
 }

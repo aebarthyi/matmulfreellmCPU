@@ -3,6 +3,7 @@
 #include "mmfree/model.hpp"
 
 #include "mmfree/kernels.hpp"
+#include "mmfree/profile.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -23,6 +24,9 @@ void proj(const Weights& w, const std::string& tag, float* out, const float* x,
   const TensorRef& nw = w.get(tag + ".normw");     // f32 [in]
   const TensorRef& sw = w.get(tag + ".scale_w");   // f32 [1]
   std::size_t out_dim = wq.shape[0], in_dim = wq.shape[1];
+  // The ternary BitLinear projections are the "matmul" work; lm_head is the same op but
+  // broken out so its (large-vocab) cost is visible separately.
+  ScopedTimer t(tag == "lm_head" ? "lm_head" : "matmul");
   bitlinear(out, x, nw.f32(), wq.i8(), sw.f32()[0], rows, in_dim, out_dim, eps, nullptr, aq,
             frac_bits);
 }
@@ -36,63 +40,83 @@ void Model::block(float* h, std::size_t T, std::size_t layer, float* rstate) {
 
   // resid = h (save before we overwrite during the attention sub-block)
   float* resid = resid_.data();
-  for (std::size_t i = 0; i < T * H; ++i) resid[i] = h[i];
+  { MMFREE_PROFILE("elementwise");
+    for (std::size_t i = 0; i < T * H; ++i) resid[i] = h[i];
+  }
 
   // ---- attention ----
-  rmsnorm(hs_.data(), h, w_.get(p + ".attn_norm.w").f32(), T, H, eps);  // hs
+  { MMFREE_PROFILE("rmsnorm");
+    rmsnorm(hs_.data(), h, w_.get(p + ".attn_norm.w").f32(), T, H, eps);  // hs
+  }
 
   proj(w_, p + ".i_proj", i_.data(), hs_.data(), T, eps, aq_, frac_bits_);
   proj(w_, p + ".f_proj", f_.data(), hs_.data(), T, eps, aq_, frac_bits_);
 
   // f = sigmoid(f); if layer>0 && lower_bound: f = lb + (1-lb)*f
   float* f = f_.data();
-  for (std::size_t n = 0; n < T * H; ++n) f[n] = 1.0f / (1.0f + std::exp(-f[n]));
-  if (cfg_.use_lower_bound && layer > 0) {
-    const float* lb = w_.get("lower_bounds").f32() + layer * H;  // [H] slice
-    for (std::size_t t = 0; t < T; ++t)
-      for (std::size_t c = 0; c < H; ++c) {
-        float* ft = f + t * H + c;
-        *ft = lb[c] + (1.0f - lb[c]) * (*ft);
-      }
+  { MMFREE_PROFILE("gate");
+    for (std::size_t n = 0; n < T * H; ++n) f[n] = 1.0f / (1.0f + std::exp(-f[n]));
+    if (cfg_.use_lower_bound && layer > 0) {
+      const float* lb = w_.get("lower_bounds").f32() + layer * H;  // [H] slice
+      for (std::size_t t = 0; t < T; ++t)
+        for (std::size_t c = 0; c < H; ++c) {
+          float* ft = f + t * H + c;
+          *ft = lb[c] + (1.0f - lb[c]) * (*ft);
+        }
+    }
   }
 
   // i = silu(i) * (1 - f);  scan input
   float* onemf = onemf_.data();
-  for (std::size_t n = 0; n < T * H; ++n) onemf[n] = 1.0f - f[n];
-  swiglu(scan_.data(), i_.data(), onemf, T * H);  // scan_ = silu(i)*(1-f)
+  { MMFREE_PROFILE("swiglu");
+    for (std::size_t n = 0; n < T * H; ++n) onemf[n] = 1.0f - f[n];
+    swiglu(scan_.data(), i_.data(), onemf, T * H);  // scan_ = silu(i)*(1-f)
+  }
 
   // recurrence (heads=1 -> head_dim=H): state = f*state + scan_i ; out_t = state.
   // `rstate` carries the recurrent state across decode steps (nullptr = fresh from zero).
-  hgrn_scan(recur_.data(), scan_.data(), f, T, H, rstate);
+  { MMFREE_PROFILE("scan");
+    hgrn_scan(recur_.data(), scan_.data(), f, T, H, rstate);
+  }
 
   // g_norm: rmsnorm(g_proj(hs)) * silu(recurrence)
   proj(w_, p + ".g_proj", g_.data(), hs_.data(), T, eps, aq_, frac_bits_);
-  rmsnorm_swishgate(oin_.data(), g_.data(), recur_.data(), w_.get(p + ".g_norm.w").f32(), T, H,
-                    eps);
+  { MMFREE_PROFILE("swishgate");
+    rmsnorm_swishgate(oin_.data(), g_.data(), recur_.data(), w_.get(p + ".g_norm.w").f32(), T, H,
+                      eps);
+  }
 
   proj(w_, p + ".o_proj", oout_.data(), oin_.data(), T, eps, aq_, frac_bits_);
 
   // ---- mlp (prenorm: residual = o + residual; hs = rmsnorm(residual)) ----
-  for (std::size_t n = 0; n < T * H; ++n) resid[n] += oout_.data()[n];
-  rmsnorm(hs_.data(), resid, w_.get(p + ".mlp_norm.w").f32(), T, H, eps);
+  { MMFREE_PROFILE("elementwise");
+    for (std::size_t n = 0; n < T * H; ++n) resid[n] += oout_.data()[n];
+  }
+  { MMFREE_PROFILE("rmsnorm");
+    rmsnorm(hs_.data(), resid, w_.get(p + ".mlp_norm.w").f32(), T, H, eps);
+  }
 
   proj(w_, p + ".gate_proj", y_.data(), hs_.data(), T, eps, aq_, frac_bits_);  // [T, 2*inter]
   // chunk(y, 2): gate = y[:, :inter], yy = y[:, inter:]; z = silu(gate)*yy
   const std::size_t full = 2 * inter;
   float* gate = gate_.data();
-  for (std::size_t t = 0; t < T; ++t) {
-    const float* yr = y_.data() + t * full;
-    for (std::size_t c = 0; c < inter; ++c) {
-      gate[t * inter + c] = yr[c];              // gate half
-      onemf_.data()[t * inter + c] = yr[inter + c];  // y half (reuse onemf_ as scratch)
+  { MMFREE_PROFILE("swiglu");
+    for (std::size_t t = 0; t < T; ++t) {
+      const float* yr = y_.data() + t * full;
+      for (std::size_t c = 0; c < inter; ++c) {
+        gate[t * inter + c] = yr[c];              // gate half
+        onemf_.data()[t * inter + c] = yr[inter + c];  // y half (reuse onemf_ as scratch)
+      }
     }
+    // z = swiglu(gate, yhalf) -> write into oin_ (>= T*inter)
+    swiglu(oin_.data(), gate, onemf_.data(), T * inter);
   }
-  // z = swiglu(gate, yhalf) -> write into oin_ (>= T*inter)
-  swiglu(oin_.data(), gate, onemf_.data(), T * inter);
 
   // down_proj(z) -> [T, H]; h = residual + z_out
   proj(w_, p + ".down_proj", oout_.data(), oin_.data(), T, eps, aq_, frac_bits_);
-  for (std::size_t n = 0; n < T * H; ++n) h[n] = resid[n] + oout_.data()[n];
+  { MMFREE_PROFILE("elementwise");
+    for (std::size_t n = 0; n < T * H; ++n) h[n] = resid[n] + oout_.data()[n];
+  }
 }
 
 void Model::ensure_scratch(std::size_t T) {
@@ -204,7 +228,9 @@ std::vector<std::int64_t> Model::generate(const std::vector<std::int64_t>& ids,
   };
   // RMSNorm + lm_head on a single hidden row -> last_logits.
   auto head = [&](const float* h_row) {
-    rmsnorm(finalnorm_.data(), h_row, norm_w, 1, H, eps);
+    { MMFREE_PROFILE("rmsnorm");
+      rmsnorm(finalnorm_.data(), h_row, norm_w, 1, H, eps);
+    }
     proj(w_, "lm_head", last_logits.data(), finalnorm_.data(), 1, eps, aq_, frac_bits_);
   };
 
@@ -217,9 +243,11 @@ std::vector<std::int64_t> Model::generate(const std::vector<std::int64_t>& ids,
   std::size_t Tp = stream.size();
   ensure_scratch(Tp);
   float* h = hbuf_.data();
-  for (std::size_t t = 0; t < Tp; ++t) {
-    const float* row = emb + static_cast<std::size_t>(stream[t]) * H;
-    for (std::size_t c = 0; c < H; ++c) h[t * H + c] = row[c];
+  { MMFREE_PROFILE("embed");
+    for (std::size_t t = 0; t < Tp; ++t) {
+      const float* row = emb + static_cast<std::size_t>(stream[t]) * H;
+      for (std::size_t c = 0; c < H; ++c) h[t * H + c] = row[c];
+    }
   }
   for (std::size_t l = 0; l < L; ++l) block(h, Tp, l, &rstate_[l * H]);
   if (new_tokens == 0) return stream;
@@ -230,8 +258,10 @@ std::vector<std::int64_t> Model::generate(const std::vector<std::int64_t>& ids,
 
   // ---- decode: one new token at a time, carrying the recurrent state (O(1)/step) ----
   for (std::size_t step = 1; step < new_tokens; ++step) {
-    const float* row = emb + static_cast<std::size_t>(stream.back()) * H;
-    for (std::size_t c = 0; c < H; ++c) h[c] = row[c];  // single position at h[0..H)
+    { MMFREE_PROFILE("embed");
+      const float* row = emb + static_cast<std::size_t>(stream.back()) * H;
+      for (std::size_t c = 0; c < H; ++c) h[c] = row[c];  // single position at h[0..H)
+    }
     for (std::size_t l = 0; l < L; ++l) block(h, 1, l, &rstate_[l * H]);
     head(h);
     t = emit();
