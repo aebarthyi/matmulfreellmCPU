@@ -1,4 +1,12 @@
 mmfreelm/__pycache__
 mmfreelm/*/__pycache__
 mmfreelm/*/*/__pycache__
+tools/__pycache__/
+cpp/golden
+cpp/golden_fixedp
+cpp/build/
 *.json
+cpp/model.mmfree
+cpp/tokenizer.mmtok
+*.mmfree
+*.mmtok
