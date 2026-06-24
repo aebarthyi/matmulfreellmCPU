@@ -10,6 +10,7 @@
 #include <cstdio>
 #include <random>
 #include <string>
+#include <utility>
 
 namespace mmfree {
 
@@ -18,8 +19,10 @@ Model::Model(const Weights& w, ActQuant aq, int frac_bits)
 
 namespace {
 // Run a fused BitLinear projection identified by `tag` (e.g. "model.layers.3.i_proj").
+// `be`/`proj_id` route the integer accumulate to an injected backend (CPU when be==nullptr).
 void proj(const Weights& w, const std::string& tag, float* out, const float* x,
-          std::size_t rows, float eps, ActQuant aq, int frac_bits) {
+          std::size_t rows, float eps, ActQuant aq, int frac_bits, TernaryBackend* be,
+          int proj_id) {
   const TensorRef& wq = w.get(tag + ".wq");        // int8 [out, in]
   const TensorRef& nw = w.get(tag + ".normw");     // f32 [in]
   const TensorRef& sw = w.get(tag + ".scale_w");   // f32 [1]
@@ -28,9 +31,23 @@ void proj(const Weights& w, const std::string& tag, float* out, const float* x,
   // broken out so its (large-vocab) cost is visible separately.
   ScopedTimer t(tag == "lm_head" ? "lm_head" : "matmul");
   bitlinear(out, x, nw.f32(), wq.i8(), sw.f32()[0], rows, in_dim, out_dim, eps, nullptr, aq,
-            frac_bits);
+            frac_bits, be, proj_id);
 }
 }  // namespace
+
+void Model::set_backend(TernaryBackend* be, std::unordered_map<std::string, int> proj_ids) {
+  backend_ = be;
+  proj_ids_ = std::move(proj_ids);
+}
+
+int Model::proj_id_for(const std::string& tag) const {
+  auto it = proj_ids_.find(tag);
+  return it == proj_ids_.end() ? -1 : it->second;
+}
+
+void Model::run_proj(const std::string& tag, float* out, const float* x, std::size_t rows) {
+  proj(w_, tag, out, x, rows, cfg_.rms_norm_eps, aq_, frac_bits_, backend_, proj_id_for(tag));
+}
 
 void Model::block(float* h, std::size_t T, std::size_t layer, float* rstate) {
   const std::size_t H = cfg_.hidden_size;
@@ -49,8 +66,8 @@ void Model::block(float* h, std::size_t T, std::size_t layer, float* rstate) {
     rmsnorm(hs_.data(), h, w_.get(p + ".attn_norm.w").f32(), T, H, eps);  // hs
   }
 
-  proj(w_, p + ".i_proj", i_.data(), hs_.data(), T, eps, aq_, frac_bits_);
-  proj(w_, p + ".f_proj", f_.data(), hs_.data(), T, eps, aq_, frac_bits_);
+  run_proj(p + ".i_proj", i_.data(), hs_.data(), T);
+  run_proj(p + ".f_proj", f_.data(), hs_.data(), T);
 
   // f = sigmoid(f); if layer>0 && lower_bound: f = lb + (1-lb)*f
   float* f = f_.data();
@@ -80,13 +97,13 @@ void Model::block(float* h, std::size_t T, std::size_t layer, float* rstate) {
   }
 
   // g_norm: rmsnorm(g_proj(hs)) * silu(recurrence)
-  proj(w_, p + ".g_proj", g_.data(), hs_.data(), T, eps, aq_, frac_bits_);
+  run_proj(p + ".g_proj", g_.data(), hs_.data(), T);
   { MMFREE_PROFILE("swishgate");
     rmsnorm_swishgate(oin_.data(), g_.data(), recur_.data(), w_.get(p + ".g_norm.w").f32(), T, H,
                       eps);
   }
 
-  proj(w_, p + ".o_proj", oout_.data(), oin_.data(), T, eps, aq_, frac_bits_);
+  run_proj(p + ".o_proj", oout_.data(), oin_.data(), T);
 
   // ---- mlp (prenorm: residual = o + residual; hs = rmsnorm(residual)) ----
   { MMFREE_PROFILE("elementwise");
@@ -96,7 +113,7 @@ void Model::block(float* h, std::size_t T, std::size_t layer, float* rstate) {
     rmsnorm(hs_.data(), resid, w_.get(p + ".mlp_norm.w").f32(), T, H, eps);
   }
 
-  proj(w_, p + ".gate_proj", y_.data(), hs_.data(), T, eps, aq_, frac_bits_);  // [T, 2*inter]
+  run_proj(p + ".gate_proj", y_.data(), hs_.data(), T);  // [T, 2*inter]
   // chunk(y, 2): gate = y[:, :inter], yy = y[:, inter:]; z = silu(gate)*yy
   const std::size_t full = 2 * inter;
   float* gate = gate_.data();
@@ -113,7 +130,7 @@ void Model::block(float* h, std::size_t T, std::size_t layer, float* rstate) {
   }
 
   // down_proj(z) -> [T, H]; h = residual + z_out
-  proj(w_, p + ".down_proj", oout_.data(), oin_.data(), T, eps, aq_, frac_bits_);
+  run_proj(p + ".down_proj", oout_.data(), oin_.data(), T);
   { MMFREE_PROFILE("elementwise");
     for (std::size_t n = 0; n < T * H; ++n) h[n] = resid[n] + oout_.data()[n];
   }
@@ -167,7 +184,7 @@ void Model::forward(const std::int64_t* ids, std::size_t T, std::vector<float>& 
   const float* fn = layers_and_norm(ids, T);
   // lm_head (ternary BitLinear) over all T positions -> logits [T, V]
   logits.assign(T * V, 0.0f);
-  proj(w_, "lm_head", logits.data(), fn, T, cfg_.rms_norm_eps, aq_, frac_bits_);
+  run_proj("lm_head", logits.data(), fn, T);
   (void)H;
 }
 
@@ -231,7 +248,7 @@ std::vector<std::int64_t> Model::generate(const std::vector<std::int64_t>& ids,
     { MMFREE_PROFILE("rmsnorm");
       rmsnorm(finalnorm_.data(), h_row, norm_w, 1, H, eps);
     }
-    proj(w_, "lm_head", last_logits.data(), finalnorm_.data(), 1, eps, aq_, frac_bits_);
+    run_proj("lm_head", last_logits.data(), finalnorm_.data(), 1);
   };
 
   // Fresh recurrent state for this generation: each layer starts from zero, then carries

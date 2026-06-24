@@ -16,6 +16,8 @@
 
 namespace mmfree {
 
+struct TernaryBackend;  // mmfree/ternary_backend.hpp — pluggable ternary-matmul seam.
+
 // Activation handling for the BitLinear projection input (post-RMSNorm y).
 //   Float      : y kept fp32 (the "triton" golden -- kernel omits activation rounding).
 //   FixedQ510  : y quantized to static signed Q(15-f).f fixed point (default Q5.10),
@@ -31,10 +33,15 @@ void rmsnorm(float* y, const float* x, const float* weight, std::size_t rows,
 // layout), norm_weight:[in], out:[rows,out_dim]. If norm_out!=nullptr, the per-row
 // RMSNorm result [rows,in] is written there (for tests/debug). `aq` selects the
 // activation numerics; `frac_bits` is the fixed-point fractional width (Q5.10 -> 10).
+//
+// `be` selects the ternary-matmul backend for the FixedQ510 (integer) path: nullptr uses
+// the built-in CPU reduction; a non-null backend (e.g. FPGA) is given `proj_id` to address
+// its resident weights. `be`/`proj_id` are ignored by the Float path. Passing nullptr
+// reproduces the historical behavior exactly.
 void bitlinear(float* out, const float* x, const float* norm_weight, const int8_t* wq,
                float scale_w, std::size_t rows, std::size_t in_dim, std::size_t out_dim,
                float eps, float* norm_out = nullptr, ActQuant aq = ActQuant::Float,
-               int frac_bits = 10);
+               int frac_bits = 10, TernaryBackend* be = nullptr, int proj_id = -1);
 
 // Elementwise. out[i] = silu(a[i]) * b[i].
 void swiglu(float* out, const float* a, const float* b, std::size_t n);

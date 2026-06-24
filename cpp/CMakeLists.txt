@@ -20,6 +20,7 @@ add_library(mmfreecpu STATIC
   src/io/tokenizer.cpp
   src/model/hgrn_model.cpp
   src/util/profile.cpp
+  src/util/bench.cpp
 )
 target_include_directories(mmfreecpu PUBLIC include)
 

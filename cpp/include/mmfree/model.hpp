@@ -13,9 +13,13 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace mmfree {
+
+struct TernaryBackend;  // mmfree/ternary_backend.hpp — pluggable ternary-matmul seam.
 
 // Decoding controls. temperature <= 0 selects greedy argmax (deterministic, the default
 // and the validation path); temperature > 0 enables sampling: logits are scaled by 1/T,
@@ -47,8 +51,19 @@ class Model {
 
   const Config& config() const { return cfg_; }
 
+  // Inject a ternary-matmul backend for the BitLinear projections plus a registry mapping
+  // each projection tag (e.g. "model.layers.3.i_proj", "lm_head") to the backend's proj_id.
+  // Default (never called) keeps the built-in CPU path. The backend is borrowed — the
+  // caller owns its lifetime and must outlive the Model. A tag absent from the registry
+  // falls back to the CPU reduction for that projection (proj_id -1).
+  void set_backend(TernaryBackend* be, std::unordered_map<std::string, int> proj_ids);
+
  private:
   void ensure_scratch(std::size_t T);
+  // Run BitLinear projection `tag` over `rows` positions, dispatching to the configured
+  // backend (CPU by default) with the tag's registered proj_id.
+  void run_proj(const std::string& tag, float* out, const float* x, std::size_t rows);
+  int proj_id_for(const std::string& tag) const;
   // Run layer `layer` over T positions. `rstate` ([hidden_size]) is the recurrent state
   // carried across calls (initial-in, final-out); nullptr = fresh zero state per call.
   void block(float* h, std::size_t T, std::size_t layer, float* rstate);
@@ -60,6 +75,11 @@ class Model {
   Config cfg_;
   ActQuant aq_;
   int frac_bits_;
+
+  // Ternary-matmul offload (set_backend). nullptr -> built-in CPU reduction; proj_ids_
+  // maps projection tag -> backend proj_id (empty -> all projections fall back to CPU).
+  TernaryBackend* backend_ = nullptr;
+  std::unordered_map<std::string, int> proj_ids_;
 
   // scratch, sized for the largest T seen (grown lazily)
   std::size_t cap_T_ = 0;

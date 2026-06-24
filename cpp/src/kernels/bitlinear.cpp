@@ -8,6 +8,7 @@
 #include "mmfree/kernels.hpp"
 
 #include "mmfree/simd.hpp"
+#include "mmfree/ternary_backend.hpp"
 
 #include <cmath>
 #include <cstdint>
@@ -17,9 +18,14 @@ namespace mmfree {
 
 void bitlinear(float* out, const float* x, const float* norm_weight, const int8_t* wq,
                float scale_w, std::size_t rows, std::size_t in_dim, std::size_t out_dim,
-               float eps, float* norm_out, ActQuant aq, int frac_bits) {
+               float eps, float* norm_out, ActQuant aq, int frac_bits, TernaryBackend* be,
+               int proj_id) {
   std::vector<float> y(in_dim);
-  std::vector<std::int32_t> yq(in_dim);  // fixed-point activations (FixedQ510)
+  std::vector<std::int32_t> yq(in_dim);   // fixed-point activations (FixedQ510)
+  std::vector<std::int32_t> acc(out_dim);  // integer accumulators (FixedQ510)
+  // Default to the built-in CPU reduction when no backend is injected.
+  static CpuBackend cpu_default;
+  TernaryBackend* backend = be ? be : &cpu_default;
   const float inv_scale_w = 1.0f / scale_w;
   const float qs = static_cast<float>(1u << frac_bits);  // 2^frac_bits
   const float inv_fixed = 1.0f / (qs * scale_w);
@@ -45,15 +51,13 @@ void bitlinear(float* out, const float* x, const float* norm_weight, const int8_
         else if (q < -32768.0f) q = -32768.0f;
         yq[c] = static_cast<std::int32_t>(q);
       }
-      // Ternary projection with integer accumulator; dequant by 2^f * scale_w.
-      // Parallel over output rows: each `o` owns its accumulator and the k-reduction
-      // stays serial, so the result is bit-identical to the single-threaded path.
-      const std::int32_t* yqp = yq.data();
-#pragma omp parallel for schedule(static)
-      for (std::size_t o = 0; o < out_dim; ++o) {
-        std::int32_t acc = simd::ternary_dot_i32(yqp, wq + o * in_dim, in_dim);
-        outr[o] = static_cast<float>(acc) * inv_fixed;
-      }
+      // Ternary projection with integer accumulator; dequant by 2^f * scale_w. The
+      // accumulate (acc[o] = sum_n yq[n]*wq[o,n]) is delegated to the backend (CPU
+      // reduction by default, or an injected accelerator); the integer result is
+      // backend-independent, so the dequant below stays bit-identical either way.
+      backend->matmul(proj_id, yq.data(), acc.data(), wq, in_dim, out_dim);
+      for (std::size_t o = 0; o < out_dim; ++o)
+        outr[o] = static_cast<float>(acc[o]) * inv_fixed;
     } else {
       // Float (triton): signed float accumulation, no activation rounding.
       // Parallel over output rows (see FixedQ510 branch): per-row reduction order is
