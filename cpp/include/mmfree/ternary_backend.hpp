@@ -27,6 +27,24 @@ struct TernaryBackend {
   // use proj_id instead.
   virtual void matmul(int proj_id, const std::int32_t* x, std::int32_t* acc,
                       const std::int8_t* wq, std::size_t N, std::size_t M) = 0;
+
+  // Preferred batch width: how many activation vectors this backend wants per call.
+  // 1 for the CPU (no win) and the b=1 bitstream; the spatial-batch FPGA returns its
+  // CoreConfig.batchSize so bitlinear chunks prefill rows into that many per call. The
+  // weight-streaming FPGA streams the resident weights ONCE per matmul_batch and applies
+  // them to all `b` rows — the whole point of batching (amortizes the DDR weight wall).
+  virtual std::size_t batch_size() const { return 1; }
+
+  // Fill acc[i*M + m] for b activation vectors x[i*N + n] (i in [0,b)), row-major. Default
+  // loops the scalar matmul per row, so any backend that doesn't override it (CpuBackend)
+  // is bit-identical to the per-row path. `b` is <= batch_size().
+  virtual void matmul_batch(int proj_id, const std::int32_t* x, std::int32_t* acc,
+                            const std::int8_t* wq, std::size_t N, std::size_t M,
+                            std::size_t b) {
+    for (std::size_t i = 0; i < b; ++i)
+      matmul(proj_id, x + i * N, acc + i * M, wq, N, M);
+  }
+
   virtual ~TernaryBackend() = default;
 };
 

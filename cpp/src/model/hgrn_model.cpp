@@ -4,6 +4,7 @@
 
 #include "mmfree/kernels.hpp"
 #include "mmfree/profile.hpp"
+#include "mmfree/simd.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -49,7 +50,7 @@ void Model::run_proj(const std::string& tag, float* out, const float* x, std::si
   proj(w_, tag, out, x, rows, cfg_.rms_norm_eps, aq_, frac_bits_, backend_, proj_id_for(tag));
 }
 
-void Model::block(float* h, std::size_t T, std::size_t layer, float* rstate) {
+void Model::block(float* h, std::size_t T, std::size_t layer, float* rstate, bool stream_state) {
   const std::size_t H = cfg_.hidden_size;
   const std::size_t inter = cfg_.intermediate_size;
   const float eps = cfg_.rms_norm_eps;
@@ -93,7 +94,15 @@ void Model::block(float* h, std::size_t T, std::size_t layer, float* rstate) {
   // recurrence (heads=1 -> head_dim=H): state = f*state + scan_i ; out_t = state.
   // `rstate` carries the recurrent state across decode steps (nullptr = fresh from zero).
   { MMFREE_PROFILE("scan");
-    hgrn_scan(recur_.data(), scan_.data(), f, T, H, rstate);
+    if (stream_state) {
+      // Serving: the T rows are T independent streams, each advancing its OWN recurrent
+      // state by one step (rstate is [T, H], contiguous per row). No cross-row dependency.
+      for (std::size_t b = 0; b < T; ++b)
+        simd::hgrn_step(rstate + b * H, recur_.data() + b * H, f + b * H,
+                        scan_.data() + b * H, H);
+    } else {
+      hgrn_scan(recur_.data(), scan_.data(), f, T, H, rstate);
+    }
   }
 
   // g_norm: rmsnorm(g_proj(hs)) * silu(recurrence)
@@ -286,6 +295,110 @@ std::vector<std::int64_t> Model::generate(const std::vector<std::int64_t>& ids,
     if (t == eos_id) break;
   }
   return stream;
+}
+
+std::vector<std::vector<std::int64_t>> Model::generate_serve(
+    const std::vector<std::vector<std::int64_t>>& prompts, std::size_t new_tokens,
+    std::int64_t eos_id, const Sampling& samp) {
+  const std::size_t H = cfg_.hidden_size;
+  const std::size_t V = cfg_.vocab_size;
+  const std::size_t L = cfg_.num_hidden_layers;
+  const float eps = cfg_.rms_norm_eps;
+  const float* emb = w_.get("model.embeddings").f32();
+  const float* norm_w = w_.get("model.norm.w").f32();
+  const std::size_t B = prompts.size();
+
+  std::vector<std::vector<std::int64_t>> streams = prompts;
+  // Per-stream recurrent state, layer-major [L][B][H] so layer l's B states are contiguous
+  // for the batched decode scan (block stream_state reads rstate as [B, H]).
+  std::vector<float> serve_state(L * B * H, 0.0f);
+  std::vector<char> done(B, 0);
+  std::vector<float> logitsB(B * V);
+
+  std::vector<std::mt19937_64> rng;
+  rng.reserve(B);
+  for (std::size_t b = 0; b < B; ++b) rng.emplace_back(samp.seed + b);
+  std::uniform_real_distribution<double> uni(0.0, 1.0);
+
+  // Pick a token from one logits row [V] (greedy argmax, or temperature/top-k sampling with
+  // this stream's RNG) — mirrors generate()'s emit, per stream.
+  auto sample_row = [&](const float* lg, std::size_t b) -> std::int64_t {
+    if (samp.temperature <= 0.0f) {
+      std::size_t chosen = 0;
+      for (std::size_t v = 1; v < V; ++v)
+        if (lg[v] > lg[chosen]) chosen = v;
+      return static_cast<std::int64_t>(chosen);
+    }
+    std::vector<std::size_t> cand(V);
+    for (std::size_t v = 0; v < V; ++v) cand[v] = v;
+    auto hotter = [&](std::size_t x, std::size_t y) { return lg[x] > lg[y]; };
+    std::size_t k = (samp.top_k > 0 && static_cast<std::size_t>(samp.top_k) < V)
+                        ? static_cast<std::size_t>(samp.top_k)
+                        : V;
+    if (k < V) {
+      std::nth_element(cand.begin(), cand.begin() + k, cand.end(), hotter);
+      cand.resize(k);
+    }
+    float maxl = lg[cand[0]];
+    for (std::size_t j = 1; j < cand.size(); ++j) maxl = std::max(maxl, lg[cand[j]]);
+    double sum = 0.0;
+    std::vector<double> p(cand.size());
+    for (std::size_t j = 0; j < cand.size(); ++j) {
+      p[j] = std::exp((lg[cand[j]] - maxl) / samp.temperature);
+      sum += p[j];
+    }
+    double r = uni(rng[b]) * sum, acc = 0.0;
+    for (std::size_t j = 0; j < cand.size(); ++j) {
+      acc += p[j];
+      if (r <= acc) return static_cast<std::int64_t>(cand[j]);
+    }
+    return static_cast<std::int64_t>(cand.back());
+  };
+
+  std::size_t maxT = B;
+  for (const auto& p : prompts) maxT = std::max(maxT, p.size());
+  ensure_scratch(maxT);
+
+  // ---- prefill each stream into its own state slice (time scan, single stream) ----
+  for (std::size_t b = 0; b < B; ++b) {
+    const std::size_t T = prompts[b].size();
+    float* h = hbuf_.data();
+    for (std::size_t t = 0; t < T; ++t) {
+      const float* row = emb + static_cast<std::size_t>(prompts[b][t]) * H;
+      for (std::size_t c = 0; c < H; ++c) h[t * H + c] = row[c];
+    }
+    for (std::size_t l = 0; l < L; ++l)
+      block(h, T, l, &serve_state[(l * B + b) * H], /*stream_state=*/false);
+    rmsnorm(finalnorm_.data(), h + (T - 1) * H, norm_w, 1, H, eps);
+    run_proj("lm_head", logitsB.data(), finalnorm_.data(), 1);
+    std::int64_t t0 = sample_row(logitsB.data(), b);
+    streams[b].push_back(t0);
+    if (t0 == eos_id) done[b] = 1;
+  }
+  if (new_tokens <= 1) return streams;
+
+  // ---- batched decode: all B streams advance together, ONE engine call per projection ----
+  for (std::size_t step = 1; step < new_tokens; ++step) {
+    float* hB = hbuf_.data();
+    for (std::size_t b = 0; b < B; ++b) {
+      const float* row = emb + static_cast<std::size_t>(streams[b].back()) * H;
+      for (std::size_t c = 0; c < H; ++c) hB[b * H + c] = row[c];
+    }
+    for (std::size_t l = 0; l < L; ++l)
+      block(hB, B, l, &serve_state[l * B * H], /*stream_state=*/true);
+    rmsnorm(finalnorm_.data(), hB, norm_w, B, H, eps);     // B rows
+    run_proj("lm_head", logitsB.data(), finalnorm_.data(), B);  // [B, V], one batched call
+    bool all_done = true;
+    for (std::size_t b = 0; b < B; ++b) {
+      if (done[b]) continue;
+      std::int64_t t = sample_row(logitsB.data() + b * V, b);
+      streams[b].push_back(t);
+      if (t == eos_id) done[b] = 1;
+      else all_done = false;
+    }
+    if (all_done) break;
+  }
+  return streams;
 }
 
 }  // namespace mmfree

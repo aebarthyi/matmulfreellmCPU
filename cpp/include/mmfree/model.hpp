@@ -49,6 +49,18 @@ class Model {
                                      const Sampling& samp = {},
                                      const std::function<void(std::int64_t)>& on_token = {});
 
+  // Serve B concurrent sequences: prefill each independently (its own recurrent state),
+  // then decode all B in lockstep — ONE batched matmul per projection per step, i.e. B
+  // tokens per weight stream (the spatial-batch throughput win, vs single-stream decode
+  // that re-streams the weights per token). Greedy or per-stream sampling (RNG seeded
+  // samp.seed + stream index). Returns the B full id streams (prompt + generated); a
+  // stream that emits eos_id stops growing but keeps its batch slot. `new_tokens` is the
+  // count generated per stream. With B identical prompts + greedy, all streams must match
+  // each other and a single-stream generate() — the serving correctness check.
+  std::vector<std::vector<std::int64_t>> generate_serve(
+      const std::vector<std::vector<std::int64_t>>& prompts, std::size_t new_tokens,
+      std::int64_t eos_id = -1, const Sampling& samp = {});
+
   const Config& config() const { return cfg_; }
 
   // Inject a ternary-matmul backend for the BitLinear projections plus a registry mapping
@@ -66,7 +78,10 @@ class Model {
   int proj_id_for(const std::string& tag) const;
   // Run layer `layer` over T positions. `rstate` ([hidden_size]) is the recurrent state
   // carried across calls (initial-in, final-out); nullptr = fresh zero state per call.
-  void block(float* h, std::size_t T, std::size_t layer, float* rstate);
+  // stream_state=true reinterprets the T rows as T independent streams (serving): rstate
+  // is [T, hidden_size] and each row advances its OWN state by one step (no time scan).
+  void block(float* h, std::size_t T, std::size_t layer, float* rstate,
+             bool stream_state = false);
   // Embed ids, run all layers, final RMSNorm; returns the final-normed hidden [T, H].
   // Stateless: each layer's recurrence starts from zero (full-prefix forward).
   const float* layers_and_norm(const std::int64_t* ids, std::size_t T);
