@@ -1,13 +1,16 @@
-# Offline provisioning toolchain — NOT needed to build or run the C++ engine itself
-# (that is pure CMake/C++). `provision.py` downloads an MMfreeLM checkpoint from the HF
-# Hub and packs it into the engine's inputs:
-#   provision.py   HF download + model.mmfree (weights) + tokenizer.mmtok
-#   reference.py   PyTorch quant/reference used by the weight packer
+# Offline toolchain for the C++ model — NOT needed to build or run the C++ engine
+# itself (that is pure CMake/C++). These provision the C++ inputs + test oracles:
+#   provision.py      HF download + pack weights (model.mmfree) + pack tokenizer
+#                     (tokenizer.mmtok) — one command does all three
+#   dump_golden.py    PyTorch oracle -> golden/*.npy  (torch, numpy)  [for ctest]
+#   reference.py      standalone PyTorch reference (torch, safetensors)
+#   compare_prompts.py / run_prompt.py / check_tokenizer.py  (validation helpers)
 #
-# The PyTorch/Triton model and the comparison/test tooling were split out — the
-# validation harness (golden-oracle dump, prompt comparison, cpp ctest suite) lives
-# on the `validation` branch, which adds its own extra deps (e.g. transformers).
+# The original PyTorch/Triton model (mmfreelm + triton-cpu) was removed once the
+# C++ implementation was verified to match it — so triton/transformers-as-model
+# are gone; transformers remains only for AutoTokenizer in the helper scripts.
 torch
 safetensors
 numpy
+transformers
 huggingface_hub

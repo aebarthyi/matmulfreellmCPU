@@ -67,7 +67,15 @@ python tools/provision.py --skip-download ...     # reuse an already-cached chec
 ```
 </details>
 
-(`model.mmfree` and `tokenizer.mmtok` are git-ignored — regenerate them as above.)
+For the test oracles (only needed for `ctest` — both modes are required, `ctest` runs a
+float `e2e` and a fixed-point `e2e_fixed`):
+
+```sh
+python tools/dump_golden.py               --out cpp/golden          # float oracle vectors
+python tools/dump_golden.py --mode fixedp --out cpp/golden_fixedp   # fixed-point oracle vectors
+```
+
+(`model.mmfree`, `tokenizer.mmtok` and `golden/` are git-ignored — regenerate them as above.)
 
 # Usage
 ## Pre-trained Model Zoo
@@ -93,19 +101,16 @@ Key flags: `--blob PATH` (weight blob, default `model.mmfree`), `--tokenizer PAT
 `<blob dir>/tokenizer.mmtok`), `--gen N` (max new tokens), `--logits-out PATH` (dump last-position
 logits as raw float32). See `cpp/app/main.cpp` for the full list.
 
-## Validation
-
-`main` is the lean engine. The correctness suite — the C++ `ctest` tests (`test_kernels`,
-`test_e2e`) plus the PyTorch-comparison tooling that generates their golden oracles
-(`dump_golden.py`, `compare_prompts.py`, `check_tokenizer.py`, …) — lives on the **`validation`**
-branch:
+## Tests
 
 ```sh
-git checkout validation   # adds cpp/tests/ + tools/ comparison scripts
+cd cpp/build
+ctest --output-on-failure     # test_kernels + test_e2e vs the golden/ oracles
 ```
 
-It was verified end-to-end: the C++ output matches the PyTorch reference exactly in both the
-float and fixed-point numeric modes.
+`ctest` needs `cpp/model.mmfree` and `cpp/golden/` (and `cpp/golden_fixedp/` for the fixed-point
+path) — generate them with `tools/provision.py` + `tools/dump_golden.py` (both modes) first. The
+C++ output is validated to match the PyTorch reference exactly (`tools/compare_prompts.py`).
 
 
 
