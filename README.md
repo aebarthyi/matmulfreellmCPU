@@ -20,30 +20,54 @@ MatMul-Free LM is a language model architecture that eliminates the need for Mat
 </div>
 We evaluate how the scaling law fits to the 370M, 1.3B and 2.7B parameter models in both Transformer++ and our model. For a fair comparison, each operation is treated identically, though our model uses more efficient ternary weights in some layers. Interestingly, the scaling projection for our model exhibits a steeper descent compared to Transformer++, suggesting our architecture is more efficient in leveraging additional compute to improve performance.
 
-# Installation
+# C++ implementation
 
-The following requirements should be satisfied 
-- [PyTorch](https://pytorch.org/) >= 2.0
-- [einops](https://einops.rocks/)
-- build-essentials and libpython3-dev (for building triton-cpu)
+This fork is a **standalone C++ inference engine** for MatMul-Free LM (HGRN-Bit). The
+original PyTorch/Triton model has been removed now that the C++ implementation is verified
+to match it bit-for-bit; what remains is the C++ engine (`cpp/`) plus a small offline Python
+toolchain (`tools/`) that packs weights/tokenizer and generates the test oracles.
+
+## Build
+
+Pure CMake/C++17 — no Python needed to build or run the engine:
+
 ```sh
-sudo apt install build-essential libpython3-dev 
+cd cpp
+cmake -B build -DCMAKE_BUILD_TYPE=Release   # SIMD backend auto-detects (NEON/AVX2/scalar)
+cmake --build build -j
+# → build/mmfree-cli, build/test_kernels, build/test_e2e
 ```
+
+## Provision the model (offline, one-time)
+
+The engine reads a packed weight blob (`cpp/model.mmfree`) and tokenizer
+(`cpp/tokenizer.mmtok`). Both are produced from a [Hugging Face checkpoint](#pre-trained-model-zoo)
+by the offline `tools/` (torch + safetensors). **`tools/provision.py` does all three steps —
+download, pack weights, pack tokenizer — in one command:**
+
 ```sh
-pip install accelerate
-pip install --upgrade transformers==4.49.0
-pip install -U git+https://github.com/aebarthyi/matmulfreellmCPU
+pip install -r tools/requirements.txt
+python tools/provision.py                          # ridger/MMfreeLM-370M -> cpp/
+# other sizes / locations:
+python tools/provision.py --model ridger/MMfreeLM-1.3B
+python tools/provision.py --out-dir cpp --skip-download   # checkpoint already cached
 ```
-# Installing triton-cpu
+
+`provision.py` pulls the checkpoint from the HF Hub via `huggingface_hub` (cached under
+`~/.cache/huggingface`; for gated/private repos run `huggingface-cli login` first — the 370M
+model is public), then writes `model.mmfree` + `tokenizer.mmtok` into `cpp/`.
+
+<details>
+<summary>Run one artifact at a time</summary>
+
 ```sh
-git submodule update --init --recursive
-cd triton-cpu
-python3 -m venv ./venv
-source venv/bin/activate
-pip3 install -r python/requirements.txt
-MAX_JOBS=4 pip3 install -e python
-pip3 show triton
+python tools/provision.py --weights-only        # just cpp/model.mmfree
+python tools/provision.py --tokenizer-only       # just cpp/tokenizer.mmtok (stdlib, no torch)
+python tools/provision.py --skip-download ...     # reuse an already-cached checkpoint
 ```
+</details>
+
+(`model.mmfree` and `tokenizer.mmtok` are git-ignored — regenerate them as above.)
 
 # Usage
 ## Pre-trained Model Zoo
@@ -53,85 +77,35 @@ pip3 show triton
 | [1.3B](https://huggingface.co/ridger/MMfreeLM-1.3B)  | 24 | 2048 | 100B  |
 | [2.7B](https://huggingface.co/ridger/MMfreeLM-2.7B)  | 32  | 2560 | 100B  |
 
-## Model
-
-We provide the implementations of models that are compatible with 🤗 Transformers library. 
-Here's an example of how to initialize a model from the default configs in `matmulfreelm`:
-This is a huggingface-compatible library that you can use such command to initialize the model with huggingface `AutoModel`:
-
-
-```py
->>> from mmfreelm.models import HGRNBitConfig
->>> from transformers import AutoModel
->>> config = HGRNBitConfig()
->>> AutoModel.from_config(config)
-HGRNBitModel(
-  (embeddings): Embedding(32000, 2048)
-  (layers): ModuleList(
-    (0): HGRNBitBlock(
-      (attn_norm): RMSNorm(2048, eps=1e-06)
-      (attn): HGRNBitAttention(
-        (i_proj): FusedBitLinear(
-          in_features=2048, out_features=2048, bias=False
-          (norm): RMSNorm(2048, eps=1e-08)
-        )
-        (f_proj): FusedBitLinear(
-          in_features=2048, out_features=2048, bias=False
-          (norm): RMSNorm(2048, eps=1e-08)
-        )
-        (g_proj): FusedBitLinear(
-          in_features=2048, out_features=2048, bias=False
-          (norm): RMSNorm(2048, eps=1e-08)
-        )
-        (g_norm): FusedRMSNormSwishGate()
-        (o_proj): FusedBitLinear(
-          in_features=2048, out_features=2048, bias=False
-          (norm): RMSNorm(2048, eps=1e-08)
-        )
-      )
-      (mlp_norm): RMSNorm(2048, eps=1e-06)
-      (mlp): HGRNBitMLP(
-        (gate_proj): FusedBitLinear(
-          in_features=2048, out_features=11264, bias=False
-          (norm): RMSNorm(2048, eps=1e-08)
-        )
-        (down_proj): FusedBitLinear(
-          in_features=5632, out_features=2048, bias=False
-          (norm): RMSNorm(5632, eps=1e-08)
-        )
-        (act_fn): SiLU()
-      )
-    )
-    
-)
->>> 
-
-```
-
 ## Generation
 
-Upon successfully pretraining a model, it becomes accessible for generating text using the 🤗 text generation APIs.
-In the following, we give a generation example in `generate.py`:
+Run the C++ engine with `mmfree-cli` (after building + provisioning above). It tokenizes the
+prompt, runs the recurrent forward loop, and decodes the new tokens:
 
-Make sure to set TRITON_CPU_BACKEND to 1 to use only the CPU
 ```sh
-TRITON_CPU_BACKEND=1 python3 generate.py
+cd cpp
+./build/mmfree-cli "In a shocking finding, scientists discovered" --gen 32
+./build/mmfree-cli --ids 1,415,310 --gen 8        # raw ids in/out (no tokenizer, no EOS stop)
+./build/mmfree-cli --bench --gen 128 --reps 5     # timing run
 ```
 
-```py
-import os
-os.environ["TOKENIZERS_PARALLELISM"] = "false"
-import mmfreelm
-from transformers import AutoModelForCausalLM, AutoTokenizer
-#Change here to our open-sourced model
-name = 'ridger/MMfreeLM-370M'
-tokenizer = AutoTokenizer.from_pretrained(name)
-model = AutoModelForCausalLM.from_pretrained(name, device_map='cpu').half()
-input_prompt = "In a shocking finding, scientist discovered a herd of unicorns living in a remote, "
-input_ids = tokenizer(input_prompt, return_tensors="pt").input_ids
-outputs = model.generate(input_ids, pad_token_id=tokenizer.eos_token_id, max_length=32, do_sample=True, top_p=0.4, temperature=0.6)
-print(tokenizer.batch_decode(outputs, skip_special_tokens=True)[0])
+Key flags: `--blob PATH` (weight blob, default `model.mmfree`), `--tokenizer PATH` (default
+`<blob dir>/tokenizer.mmtok`), `--gen N` (max new tokens), `--logits-out PATH` (dump last-position
+logits as raw float32). See `cpp/app/main.cpp` for the full list.
+
+## Validation
+
+`main` is the lean engine. The correctness suite — the C++ `ctest` tests (`test_kernels`,
+`test_e2e`) plus the PyTorch-comparison tooling that generates their golden oracles
+(`dump_golden.py`, `compare_prompts.py`, `check_tokenizer.py`, …) — lives on the **`validation`**
+branch:
+
+```sh
+git checkout validation   # adds cpp/tests/ + tools/ comparison scripts
 ```
+
+It was verified end-to-end: the C++ output matches the PyTorch reference exactly in both the
+float and fixed-point numeric modes.
 
 
 

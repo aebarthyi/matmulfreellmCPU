@@ -63,21 +63,26 @@ endif()
 add_executable(mmfree-cli app/main.cpp)
 target_link_libraries(mmfree-cli PRIVATE mmfreecpu)
 
-enable_testing()
-add_executable(test_kernels tests/test_kernels.cpp)
-target_link_libraries(test_kernels PRIVATE mmfreecpu)
-target_include_directories(test_kernels PRIVATE tests)
-# run from the cpp/ source dir so the default golden/ path resolves; argv[2] = fixed-point golden
-add_test(NAME kernels
-         COMMAND test_kernels ${CMAKE_CURRENT_SOURCE_DIR}/golden
-                              ${CMAKE_CURRENT_SOURCE_DIR}/golden_fixedp)
+# Validation tests live on the `validation` branch (with the golden-oracle tooling
+# in tools/). They build only when tests/ is present, so this same CMakeLists works
+# on the lean `main` branch (engine only) and on `validation` (engine + tests).
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_kernels.cpp)
+  enable_testing()
+  add_executable(test_kernels tests/test_kernels.cpp)
+  target_link_libraries(test_kernels PRIVATE mmfreecpu)
+  target_include_directories(test_kernels PRIVATE tests)
+  # run from the cpp/ source dir so the default golden/ path resolves; argv[2] = fixed-point golden
+  add_test(NAME kernels
+           COMMAND test_kernels ${CMAKE_CURRENT_SOURCE_DIR}/golden
+                                ${CMAKE_CURRENT_SOURCE_DIR}/golden_fixedp)
 
-add_executable(test_e2e tests/test_e2e.cpp)
-target_link_libraries(test_e2e PRIVATE mmfreecpu)
-target_include_directories(test_e2e PRIVATE tests)
-add_test(NAME e2e
-         COMMAND test_e2e ${CMAKE_CURRENT_SOURCE_DIR}/golden
-                          ${CMAKE_CURRENT_SOURCE_DIR}/model.mmfree float)
-add_test(NAME e2e_fixed
-         COMMAND test_e2e ${CMAKE_CURRENT_SOURCE_DIR}/golden_fixedp
-                          ${CMAKE_CURRENT_SOURCE_DIR}/model.mmfree fixed)
+  add_executable(test_e2e tests/test_e2e.cpp)
+  target_link_libraries(test_e2e PRIVATE mmfreecpu)
+  target_include_directories(test_e2e PRIVATE tests)
+  add_test(NAME e2e
+           COMMAND test_e2e ${CMAKE_CURRENT_SOURCE_DIR}/golden
+                            ${CMAKE_CURRENT_SOURCE_DIR}/model.mmfree float)
+  add_test(NAME e2e_fixed
+           COMMAND test_e2e ${CMAKE_CURRENT_SOURCE_DIR}/golden_fixedp
+                            ${CMAKE_CURRENT_SOURCE_DIR}/model.mmfree fixed)
+endif()

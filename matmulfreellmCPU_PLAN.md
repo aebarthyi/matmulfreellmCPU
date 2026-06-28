@@ -1,5 +1,11 @@
 # matmulfreellmCPU — Plan: PyTorch + Triton → consolidated C++ CPU inference
 
+> **2026-06-27: the PyTorch/Triton model was REMOVED.** This is now a C++-only repo
+> (`cpp/`) plus the offline `tools/` toolchain (torch+safetensors, no triton/transformers-as-
+> model) that packs weights/tokenizer and dumps the test oracles. The C++ port is verified to
+> match the old reference exactly, so `mmfreelm/`, `triton-cpu/`, `generate*.py`, `setup.py`
+> and the mmfreelm-coupled tools are gone. See README.md.
+
 > **NEXT UP (2026-06-23): PERFORMANCE.** Correctness is done (P1/P4 — C++ port is e2e
 > exact, ~9.6 min wall single-threaded scalar). Tomorrow = multithreading + optimizations.
 > Order, biggest win first: **(1) KV-cache / incremental decode** in `Model::generate`

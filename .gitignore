@@ -1,6 +1,4 @@
-mmfreelm/__pycache__
-mmfreelm/*/__pycache__
-mmfreelm/*/*/__pycache__
+__pycache__/
 tools/__pycache__/
 cpp/golden
 cpp/golden_fixedp

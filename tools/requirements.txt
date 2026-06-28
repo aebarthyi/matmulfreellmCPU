@@ -1,0 +1,13 @@
+# Offline provisioning toolchain — NOT needed to build or run the C++ engine itself
+# (that is pure CMake/C++). `provision.py` downloads an MMfreeLM checkpoint from the HF
+# Hub and packs it into the engine's inputs:
+#   provision.py   HF download + model.mmfree (weights) + tokenizer.mmtok
+#   reference.py   PyTorch quant/reference used by the weight packer
+#
+# The PyTorch/Triton model and the comparison/test tooling were split out — the
+# validation harness (golden-oracle dump, prompt comparison, cpp ctest suite) lives
+# on the `validation` branch, which adds its own extra deps (e.g. transformers).
+torch
+safetensors
+numpy
+huggingface_hub
