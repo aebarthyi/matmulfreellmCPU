@@ -13,10 +13,18 @@
 //     product y*(+-1/0) is itself exact, so the deviation from scalar is pure
 //     reduction-order noise (~1e-6), well under the e2e logit tolerance.
 //   * hgrn_step is elementwise (no reduction) -> bit-exact per lane.
+//   * exp/sigmoid/silu/swiglu use a Cephes single-precision exp polynomial (range
+//     reduction + 6th-order minimax) in place of libm expf. Max relative error
+//     ~1e-7 (under 1 ulp), so the deviation from the libm-based scalar reference is
+//     far below the e2e logit tolerance (the kernel tests check rel_l2<=1e-5 /
+//     max_abs<=1e-4). The scalar tail uses the same polynomial so the vector body
+//     and tail of a single call agree.
 #pragma once
 
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 
 #if defined(MMFREE_ARCH_X86)
 #include <immintrin.h>
@@ -143,6 +151,182 @@ inline std::int32_t ternary_dot_i32(const std::int32_t* yq, const std::int8_t* w
     else if (wk < 0) s -= yq[k];
   }
   return s;
+}
+
+// Quantize y[0..n) to Q(15-f).f int16-range codes stored as int32: round y*qs to
+// nearest (ties to even) then saturate to [-32768, 32767]. The SIMD convert ops
+// (vcvtnq_s32_f32 / _mm256_cvtps_epi32) use round-to-nearest-ties-to-even, matching
+// nearbyintf under the program's (never-changed) default rounding mode, and the
+// min/max clamp matches the scalar saturation -> BIT-EXACT vs the scalar reference.
+// Replaces a per-element libm nearbyintf call (the dominant FixedQ510 CPU cost).
+inline void quant_q510(std::int32_t* yq, const float* y, float qs, std::size_t n) {
+  std::size_t c = 0;
+#if defined(MMFREE_ARCH_X86)
+  const __m256 vqs = _mm256_set1_ps(qs);
+  const __m256i lo = _mm256_set1_epi32(-32768), hi = _mm256_set1_epi32(32767);
+  for (; c + 8 <= n; c += 8) {
+    __m256i q = _mm256_cvtps_epi32(_mm256_mul_ps(_mm256_loadu_ps(y + c), vqs));
+    q = _mm256_min_epi32(_mm256_max_epi32(q, lo), hi);
+    _mm256_storeu_si256(reinterpret_cast<__m256i*>(yq + c), q);
+  }
+#elif defined(MMFREE_ARCH_ARM)
+  const float32x4_t vqs = vdupq_n_f32(qs);
+  const int32x4_t lo = vdupq_n_s32(-32768), hi = vdupq_n_s32(32767);
+  for (; c + 4 <= n; c += 4) {
+    int32x4_t q = vcvtnq_s32_f32(vmulq_f32(vld1q_f32(y + c), vqs));
+    q = vminq_s32(vmaxq_s32(q, lo), hi);
+    vst1q_s32(yq + c, q);
+  }
+#endif
+  for (; c < n; ++c) {
+    float q = std::nearbyintf(y[c] * qs);
+    if (q > 32767.0f) q = 32767.0f;
+    else if (q < -32768.0f) q = -32768.0f;
+    yq[c] = static_cast<std::int32_t>(q);
+  }
+}
+
+// out[o] = (float)acc[o] * scale.  int32->float uses round-to-nearest (both scalar
+// and SIMD), single multiply per element -> BIT-EXACT vs the scalar reference.
+inline void dequant_scale(float* out, const std::int32_t* acc, float scale, std::size_t n) {
+  std::size_t o = 0;
+#if defined(MMFREE_ARCH_X86)
+  const __m256 vs = _mm256_set1_ps(scale);
+  for (; o + 8 <= n; o += 8) {
+    __m256 f = _mm256_cvtepi32_ps(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(acc + o)));
+    _mm256_storeu_ps(out + o, _mm256_mul_ps(f, vs));
+  }
+#elif defined(MMFREE_ARCH_ARM)
+  const float32x4_t vs = vdupq_n_f32(scale);
+  for (; o + 4 <= n; o += 4) {
+    vst1q_f32(out + o, vmulq_f32(vcvtq_f32_s32(vld1q_s32(acc + o)), vs));
+  }
+#endif
+  for (; o < n; ++o) out[o] = static_cast<float>(acc[o]) * scale;
+}
+
+// --- exp(x) (Cephes single-precision): fx = floor(x*log2(e)+0.5); r = x - fx*ln2
+// (ln2 split hi/lo for a few extra bits); exp(r) via a 6th-order minimax poly;
+// 2^fx by building the float exponent field. Input is clamped to +-88.376 so the
+// integer exponent never overflows. See the numerics contract at top of file. ---
+inline float expf_poly(float x) {
+  if (x > 88.3762626647949f) x = 88.3762626647949f;
+  else if (x < -88.3762626647949f) x = -88.3762626647949f;
+  float fx = std::floor(x * 1.44269504088896341f + 0.5f);
+  float r = x - fx * 0.693359375f;
+  r = r - fx * (-2.12194440e-4f);
+  float p = 1.9875691500E-4f;
+  p = p * r + 1.3981999507E-3f;
+  p = p * r + 8.3334519073E-3f;
+  p = p * r + 4.1665795894E-2f;
+  p = p * r + 1.6666665459E-1f;
+  p = p * r + 5.0000001201E-1f;
+  p = p * (r * r) + r + 1.0f;
+  std::int32_t e = (static_cast<std::int32_t>(fx) + 127) << 23;
+  float pow2n;
+  std::memcpy(&pow2n, &e, sizeof(pow2n));
+  return p * pow2n;
+}
+
+#if defined(MMFREE_ARCH_X86)
+inline __m256 exp8_ps(__m256 x) {
+  x = _mm256_min_ps(_mm256_max_ps(x, _mm256_set1_ps(-88.3762626647949f)),
+                    _mm256_set1_ps(88.3762626647949f));
+  __m256 fx = _mm256_floor_ps(
+      _mm256_fmadd_ps(x, _mm256_set1_ps(1.44269504088896341f), _mm256_set1_ps(0.5f)));
+  __m256 r = _mm256_fnmadd_ps(fx, _mm256_set1_ps(0.693359375f), x);
+  r = _mm256_fnmadd_ps(fx, _mm256_set1_ps(-2.12194440e-4f), r);
+  __m256 p = _mm256_set1_ps(1.9875691500E-4f);
+  p = _mm256_fmadd_ps(p, r, _mm256_set1_ps(1.3981999507E-3f));
+  p = _mm256_fmadd_ps(p, r, _mm256_set1_ps(8.3334519073E-3f));
+  p = _mm256_fmadd_ps(p, r, _mm256_set1_ps(4.1665795894E-2f));
+  p = _mm256_fmadd_ps(p, r, _mm256_set1_ps(1.6666665459E-1f));
+  p = _mm256_fmadd_ps(p, r, _mm256_set1_ps(5.0000001201E-1f));
+  p = _mm256_fmadd_ps(p, _mm256_mul_ps(r, r), _mm256_add_ps(r, _mm256_set1_ps(1.0f)));
+  __m256i e = _mm256_slli_epi32(
+      _mm256_add_epi32(_mm256_cvttps_epi32(fx), _mm256_set1_epi32(127)), 23);
+  return _mm256_mul_ps(p, _mm256_castsi256_ps(e));
+}
+#elif defined(MMFREE_ARCH_ARM)
+inline float32x4_t exp4_f32(float32x4_t x) {
+  x = vminq_f32(vmaxq_f32(x, vdupq_n_f32(-88.3762626647949f)), vdupq_n_f32(88.3762626647949f));
+  float32x4_t fx = vrndmq_f32(  // floor(x*log2(e) + 0.5)
+      vmlaq_f32(vdupq_n_f32(0.5f), x, vdupq_n_f32(1.44269504088896341f)));
+  float32x4_t r = vmlsq_f32(x, fx, vdupq_n_f32(0.693359375f));
+  r = vmlsq_f32(r, fx, vdupq_n_f32(-2.12194440e-4f));
+  float32x4_t p = vdupq_n_f32(1.9875691500E-4f);
+  p = vmlaq_f32(vdupq_n_f32(1.3981999507E-3f), p, r);
+  p = vmlaq_f32(vdupq_n_f32(8.3334519073E-3f), p, r);
+  p = vmlaq_f32(vdupq_n_f32(4.1665795894E-2f), p, r);
+  p = vmlaq_f32(vdupq_n_f32(1.6666665459E-1f), p, r);
+  p = vmlaq_f32(vdupq_n_f32(5.0000001201E-1f), p, r);
+  p = vmlaq_f32(vaddq_f32(r, vdupq_n_f32(1.0f)), p, vmulq_f32(r, r));
+  int32x4_t e = vshlq_n_s32(vaddq_s32(vcvtq_s32_f32(fx), vdupq_n_s32(127)), 23);
+  return vmulq_f32(p, vreinterpretq_f32_s32(e));
+}
+#endif
+
+// out[i] = 1/(1+exp(-x[i]))  (logistic sigmoid).
+inline void sigmoid(float* out, const float* x, std::size_t n) {
+  std::size_t i = 0;
+#if defined(MMFREE_ARCH_X86)
+  const __m256 one = _mm256_set1_ps(1.0f), sign = _mm256_set1_ps(-0.0f);
+  for (; i + 8 <= n; i += 8) {
+    __m256 e = exp8_ps(_mm256_xor_ps(_mm256_loadu_ps(x + i), sign));
+    _mm256_storeu_ps(out + i, _mm256_div_ps(one, _mm256_add_ps(one, e)));
+  }
+#elif defined(MMFREE_ARCH_ARM)
+  const float32x4_t one = vdupq_n_f32(1.0f);
+  for (; i + 4 <= n; i += 4) {
+    float32x4_t e = exp4_f32(vnegq_f32(vld1q_f32(x + i)));
+    vst1q_f32(out + i, vdivq_f32(one, vaddq_f32(one, e)));
+  }
+#endif
+  for (; i < n; ++i) out[i] = 1.0f / (1.0f + expf_poly(-x[i]));
+}
+
+// out[i] = silu(x[i]) = x[i]/(1+exp(-x[i])).
+inline void silu(float* out, const float* x, std::size_t n) {
+  std::size_t i = 0;
+#if defined(MMFREE_ARCH_X86)
+  const __m256 one = _mm256_set1_ps(1.0f), sign = _mm256_set1_ps(-0.0f);
+  for (; i + 8 <= n; i += 8) {
+    __m256 xv = _mm256_loadu_ps(x + i);
+    __m256 e = exp8_ps(_mm256_xor_ps(xv, sign));
+    _mm256_storeu_ps(out + i, _mm256_div_ps(xv, _mm256_add_ps(one, e)));
+  }
+#elif defined(MMFREE_ARCH_ARM)
+  const float32x4_t one = vdupq_n_f32(1.0f);
+  for (; i + 4 <= n; i += 4) {
+    float32x4_t xv = vld1q_f32(x + i);
+    float32x4_t e = exp4_f32(vnegq_f32(xv));
+    vst1q_f32(out + i, vdivq_f32(xv, vaddq_f32(one, e)));
+  }
+#endif
+  for (; i < n; ++i) out[i] = x[i] / (1.0f + expf_poly(-x[i]));
+}
+
+// out[i] = silu(a[i]) * b[i].
+inline void swiglu(float* out, const float* a, const float* b, std::size_t n) {
+  std::size_t i = 0;
+#if defined(MMFREE_ARCH_X86)
+  const __m256 one = _mm256_set1_ps(1.0f), sign = _mm256_set1_ps(-0.0f);
+  for (; i + 8 <= n; i += 8) {
+    __m256 av = _mm256_loadu_ps(a + i);
+    __m256 e = exp8_ps(_mm256_xor_ps(av, sign));
+    __m256 s = _mm256_div_ps(av, _mm256_add_ps(one, e));
+    _mm256_storeu_ps(out + i, _mm256_mul_ps(s, _mm256_loadu_ps(b + i)));
+  }
+#elif defined(MMFREE_ARCH_ARM)
+  const float32x4_t one = vdupq_n_f32(1.0f);
+  for (; i + 4 <= n; i += 4) {
+    float32x4_t av = vld1q_f32(a + i);
+    float32x4_t e = exp4_f32(vnegq_f32(av));
+    float32x4_t s = vdivq_f32(av, vaddq_f32(one, e));
+    vst1q_f32(out + i, vmulq_f32(s, vld1q_f32(b + i)));
+  }
+#endif
+  for (; i < n; ++i) out[i] = (a[i] / (1.0f + expf_poly(-a[i]))) * b[i];
 }
 
 // One HGRN time step over D lanes: state = f*state + i ; out = state.

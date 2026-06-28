@@ -75,6 +75,10 @@ class Model {
   // Run BitLinear projection `tag` over `rows` positions, dispatching to the configured
   // backend (CPU by default) with the tag's registered proj_id.
   void run_proj(const std::string& tag, float* out, const float* x, std::size_t rows);
+  // Run k BitLinear projections sharing input `x` as a cluster (e.g. i/f/g) — same as
+  // k run_proj calls, but routed through the backend's pipelined matmul_seq.
+  void run_proj_cluster(const std::string* tags, float* const* outs, int k,
+                        const float* x, std::size_t rows);
   int proj_id_for(const std::string& tag) const;
   // Run layer `layer` over T positions. `rstate` ([hidden_size]) is the recurrent state
   // carried across calls (initial-in, final-out); nullptr = fresh zero state per call.

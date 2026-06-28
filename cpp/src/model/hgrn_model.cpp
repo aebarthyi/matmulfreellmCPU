@@ -50,6 +50,32 @@ void Model::run_proj(const std::string& tag, float* out, const float* x, std::si
   proj(w_, tag, out, x, rows, cfg_.rms_norm_eps, aq_, frac_bits_, backend_, proj_id_for(tag));
 }
 
+void Model::run_proj_cluster(const std::string* tags, float* const* outs, int k,
+                             const float* x, std::size_t rows) {
+  // Float mode has no backend offload / cluster path — fall back to per-projection.
+  if (aq_ != ActQuant::FixedQ510) {
+    for (int j = 0; j < k; ++j) run_proj(tags[j], outs[j], x, rows);
+    return;
+  }
+  std::vector<const float*> normws(k);
+  std::vector<const std::int8_t*> wqs(k);
+  std::vector<float> scales(k);
+  std::vector<int> proj_ids(k);
+  std::size_t in_dim = 0, out_dim = 0;
+  for (int j = 0; j < k; ++j) {
+    const TensorRef& wq = w_.get(tags[j] + ".wq");
+    normws[j]   = w_.get(tags[j] + ".normw").f32();
+    wqs[j]      = wq.i8();
+    scales[j]   = w_.get(tags[j] + ".scale_w").f32()[0];
+    proj_ids[j] = proj_id_for(tags[j]);
+    out_dim = wq.shape[0];
+    in_dim  = wq.shape[1];  // i/f/g share in_dim/out_dim (== hidden_size)
+  }
+  ScopedTimer t("matmul");
+  bitlinear_cluster(outs, x, normws.data(), wqs.data(), scales.data(), k, rows, in_dim,
+                    out_dim, cfg_.rms_norm_eps, frac_bits_, backend_, proj_ids.data());
+}
+
 void Model::block(float* h, std::size_t T, std::size_t layer, float* rstate, bool stream_state) {
   const std::size_t H = cfg_.hidden_size;
   const std::size_t inter = cfg_.intermediate_size;
@@ -67,13 +93,20 @@ void Model::block(float* h, std::size_t T, std::size_t layer, float* rstate, boo
     rmsnorm(hs_.data(), h, w_.get(p + ".attn_norm.w").f32(), T, H, eps);  // hs
   }
 
-  run_proj(p + ".i_proj", i_.data(), hs_.data(), T);
-  run_proj(p + ".f_proj", f_.data(), hs_.data(), T);
+  // i/f/g all read the same post-attn-norm hs (each with its own inner RMSNorm) and have
+  // no engine dependency between them — the only independent projection cluster in the
+  // block. g_proj is hoisted up from below (its result g_ isn't consumed until swishgate,
+  // and nothing between here and there mutates hs_) so the three pipeline as one cluster.
+  {
+    const std::string cluster_tags[3] = {p + ".i_proj", p + ".f_proj", p + ".g_proj"};
+    float* const cluster_outs[3] = {i_.data(), f_.data(), g_.data()};
+    run_proj_cluster(cluster_tags, cluster_outs, 3, hs_.data(), T);
+  }
 
   // f = sigmoid(f); if layer>0 && lower_bound: f = lb + (1-lb)*f
   float* f = f_.data();
   { MMFREE_PROFILE("gate");
-    for (std::size_t n = 0; n < T * H; ++n) f[n] = 1.0f / (1.0f + std::exp(-f[n]));
+    simd::sigmoid(f, f, T * H);  // f = sigmoid(f), vectorized exp (see simd.hpp)
     if (cfg_.use_lower_bound && layer > 0) {
       const float* lb = w_.get("lower_bounds").f32() + layer * H;  // [H] slice
       for (std::size_t t = 0; t < T; ++t)
@@ -105,8 +138,7 @@ void Model::block(float* h, std::size_t T, std::size_t layer, float* rstate, boo
     }
   }
 
-  // g_norm: rmsnorm(g_proj(hs)) * silu(recurrence)
-  run_proj(p + ".g_proj", g_.data(), hs_.data(), T);
+  // g_norm: rmsnorm(g_proj(hs)) * silu(recurrence)   [g_ computed above in the i/f/g cluster]
   { MMFREE_PROFILE("swishgate");
     rmsnorm_swishgate(oin_.data(), g_.data(), recur_.data(), w_.get(p + ".g_norm.w").f32(), T, H,
                       eps);

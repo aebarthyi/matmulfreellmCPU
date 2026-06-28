@@ -18,6 +18,8 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
+#include <vector>
 
 namespace mmfree {
 
@@ -43,6 +45,28 @@ struct TernaryBackend {
                             std::size_t b) {
     for (std::size_t i = 0; i < b; ++i)
       matmul(proj_id, x + i * N, acc + i * M, wq, N, M);
+  }
+
+  // Run k projections that share dims (N,M,b) as a CLUSTER (e.g. i/f/g, all reading
+  // the same RMSNorm input). For each j in [0,k): produce(j, xq) fills b*N int32
+  // activations for projection j, the backend accumulates acc[b*M], then
+  // consume(j, acc) consumes it. proj_ids[j] addresses resident weights (FPGA);
+  // wqs[j] is the CPU weight matrix [M,N] (the default/CPU path uses it).
+  //
+  // The default runs strictly serial (produce -> matmul_batch -> consume), so it is
+  // BIT-IDENTICAL to k independent matmul_batch calls. A backend whose per-call cost
+  // splits into engine work and overlappable CPU work (FPGA) overrides this to slot
+  // produce(n+1)/consume(n-1) into the engine's wait windows.
+  virtual void matmul_seq(const int* proj_ids, const std::int8_t* const* wqs, int k,
+                          const std::function<void(int, std::int32_t*)>& produce,
+                          const std::function<void(int, const std::int32_t*)>& consume,
+                          std::size_t N, std::size_t M, std::size_t b) {
+    std::vector<std::int32_t> xq(b * N), acc(b * M);
+    for (int j = 0; j < k; ++j) {
+      produce(j, xq.data());
+      matmul_batch(proj_ids[j], xq.data(), acc.data(), wqs[j], N, M, b);
+      consume(j, acc.data());
+    }
   }
 
   virtual ~TernaryBackend() = default;

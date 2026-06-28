@@ -43,6 +43,17 @@ void bitlinear(float* out, const float* x, const float* norm_weight, const int8_
                float eps, float* norm_out = nullptr, ActQuant aq = ActQuant::Float,
                int frac_bits = 10, TernaryBackend* be = nullptr, int proj_id = -1);
 
+// Cluster of k BitLinear projections sharing one input x and dims (in_dim,out_dim),
+// each with its own norm_weight/scale_w/wq/proj_id/out buffer (i/f/g: same post-attn
+// hs, distinct per-projection inner RMSNorm). FixedQ510 only. Equivalent to k bitlinear()
+// calls (norm_out=nullptr) but routed through TernaryBackend::matmul_seq, letting an
+// overlapping backend hide the CPU front/back-end under the engine. `be`==nullptr uses
+// the built-in CPU reduction. Bit-identical to the per-projection path.
+void bitlinear_cluster(float* const* outs, const float* x, const float* const* norm_weights,
+                       const int8_t* const* wqs, const float* scale_w, int k,
+                       std::size_t rows, std::size_t in_dim, std::size_t out_dim, float eps,
+                       int frac_bits, TernaryBackend* be, const int* proj_ids);
+
 // Elementwise. out[i] = silu(a[i]) * b[i].
 void swiglu(float* out, const float* a, const float* b, std::size_t n);
 

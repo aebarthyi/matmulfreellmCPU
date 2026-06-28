@@ -1,14 +1,12 @@
-// activations.cpp — SiLU / swiglu elementwise (scalar reference).
+// activations.cpp — SiLU / swiglu elementwise.
 #include "mmfree/kernels.hpp"
 
-#include <cmath>
+#include "mmfree/simd.hpp"
 
 namespace mmfree {
 
-static inline float silu(float x) { return x / (1.0f + std::exp(-x)); }
-
 void swiglu(float* out, const float* a, const float* b, std::size_t n) {
-  for (std::size_t i = 0; i < n; ++i) out[i] = silu(a[i]) * b[i];
+  simd::swiglu(out, a, b, n);  // out = silu(a)*b, vectorized exp (see simd.hpp)
 }
 
 }  // namespace mmfree
