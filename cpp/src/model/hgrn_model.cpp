@@ -3,6 +3,7 @@
 #include "mmfree/model.hpp"
 
 #include "mmfree/kernels.hpp"
+#include "mmfree/parallel.hpp"
 #include "mmfree/profile.hpp"
 #include "mmfree/simd.hpp"
 
@@ -85,7 +86,9 @@ void Model::block(float* h, std::size_t T, std::size_t layer, float* rstate, boo
   // resid = h (save before we overwrite during the attention sub-block)
   float* resid = resid_.data();
   { MMFREE_PROFILE("elementwise");
-    for (std::size_t i = 0; i < T * H; ++i) resid[i] = h[i];
+    parallel_chunks(T * H, [&](std::size_t off, std::size_t len) {
+      for (std::size_t i = off; i < off + len; ++i) resid[i] = h[i];
+    });
   }
 
   // ---- attention ----
@@ -106,21 +109,27 @@ void Model::block(float* h, std::size_t T, std::size_t layer, float* rstate, boo
   // f = sigmoid(f); if layer>0 && lower_bound: f = lb + (1-lb)*f
   float* f = f_.data();
   { MMFREE_PROFILE("gate");
-    simd::sigmoid(f, f, T * H);  // f = sigmoid(f), vectorized exp (see simd.hpp)
+    // f = sigmoid(f), vectorized exp (see simd.hpp); elementwise -> chunk across threads.
+    parallel_chunks(T * H, [&](std::size_t off, std::size_t len) {
+      simd::sigmoid(f + off, f + off, len);
+    });
     if (cfg_.use_lower_bound && layer > 0) {
       const float* lb = w_.get("lower_bounds").f32() + layer * H;  // [H] slice
-      for (std::size_t t = 0; t < T; ++t)
+      parallel_rows(T, [&](std::size_t t) {
         for (std::size_t c = 0; c < H; ++c) {
           float* ft = f + t * H + c;
           *ft = lb[c] + (1.0f - lb[c]) * (*ft);
         }
+      });
     }
   }
 
   // i = silu(i) * (1 - f);  scan input
   float* onemf = onemf_.data();
   { MMFREE_PROFILE("swiglu");
-    for (std::size_t n = 0; n < T * H; ++n) onemf[n] = 1.0f - f[n];
+    parallel_chunks(T * H, [&](std::size_t off, std::size_t len) {
+      for (std::size_t n = off; n < off + len; ++n) onemf[n] = 1.0f - f[n];
+    });
     swiglu(scan_.data(), i_.data(), onemf, T * H);  // scan_ = silu(i)*(1-f)
   }
 
@@ -129,10 +138,12 @@ void Model::block(float* h, std::size_t T, std::size_t layer, float* rstate, boo
   { MMFREE_PROFILE("scan");
     if (stream_state) {
       // Serving: the T rows are T independent streams, each advancing its OWN recurrent
-      // state by one step (rstate is [T, H], contiguous per row). No cross-row dependency.
-      for (std::size_t b = 0; b < T; ++b)
+      // state by one step (rstate is [T, H], contiguous per row). No cross-row dependency,
+      // so row-parallel is bit-identical.
+      parallel_rows(T, [&](std::size_t b) {
         simd::hgrn_step(rstate + b * H, recur_.data() + b * H, f + b * H,
                         scan_.data() + b * H, H);
+      });
     } else {
       hgrn_scan(recur_.data(), scan_.data(), f, T, H, rstate);
     }
@@ -148,7 +159,10 @@ void Model::block(float* h, std::size_t T, std::size_t layer, float* rstate, boo
 
   // ---- mlp (prenorm: residual = o + residual; hs = rmsnorm(residual)) ----
   { MMFREE_PROFILE("elementwise");
-    for (std::size_t n = 0; n < T * H; ++n) resid[n] += oout_.data()[n];
+    const float* o = oout_.data();
+    parallel_chunks(T * H, [&](std::size_t off, std::size_t len) {
+      for (std::size_t n = off; n < off + len; ++n) resid[n] += o[n];
+    });
   }
   { MMFREE_PROFILE("rmsnorm");
     rmsnorm(hs_.data(), resid, w_.get(p + ".mlp_norm.w").f32(), T, H, eps);
@@ -159,13 +173,13 @@ void Model::block(float* h, std::size_t T, std::size_t layer, float* rstate, boo
   const std::size_t full = 2 * inter;
   float* gate = gate_.data();
   { MMFREE_PROFILE("swiglu");
-    for (std::size_t t = 0; t < T; ++t) {
+    parallel_rows(T, [&](std::size_t t) {
       const float* yr = y_.data() + t * full;
       for (std::size_t c = 0; c < inter; ++c) {
         gate[t * inter + c] = yr[c];              // gate half
         onemf_.data()[t * inter + c] = yr[inter + c];  // y half (reuse onemf_ as scratch)
       }
-    }
+    });
     // z = swiglu(gate, yhalf) -> write into oin_ (>= T*inter)
     swiglu(oin_.data(), gate, onemf_.data(), T * inter);
   }
@@ -173,7 +187,10 @@ void Model::block(float* h, std::size_t T, std::size_t layer, float* rstate, boo
   // down_proj(z) -> [T, H]; h = residual + z_out
   run_proj(p + ".down_proj", oout_.data(), oin_.data(), T);
   { MMFREE_PROFILE("elementwise");
-    for (std::size_t n = 0; n < T * H; ++n) h[n] = resid[n] + oout_.data()[n];
+    const float* o = oout_.data();
+    parallel_chunks(T * H, [&](std::size_t off, std::size_t len) {
+      for (std::size_t n = off; n < off + len; ++n) h[n] = resid[n] + o[n];
+    });
   }
 }
 

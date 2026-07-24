@@ -7,6 +7,7 @@
 // lanes (int32 -- the HW datapath), dequantized by acc / (2^f * scale_w).
 #include "mmfree/kernels.hpp"
 
+#include "mmfree/parallel.hpp"
 #include "mmfree/simd.hpp"
 #include "mmfree/ternary_backend.hpp"
 
@@ -43,30 +44,44 @@ void bitlinear(float* out, const float* x, const float* norm_weight, const int8_
     // the CPU result is bit-identical. The integer accumulate is backend-independent, so
     // the dequant stays bit-identical regardless of B.
     const std::size_t B = std::max<std::size_t>(1, backend->batch_size());
-    thread_local std::vector<std::int32_t> yqb, accb;
+    // SHARED staging buffers (NOT thread_local): the parallel_rows workers below each
+    // write their own row's slice, and the SERIAL matmul_batch consumes the whole buffer.
+    // thread_local would give each worker its own size-0 copy (resized only on the main
+    // thread) -> out-of-bounds write. Safe as `static` because bitlinear runs on the single
+    // model thread (the parallelism is internal to this call); revisit if bitlinear is ever
+    // made concurrently callable (e.g. a multi-group interleave -> per-group buffers).
+    static std::vector<std::int32_t> yqb, accb;
     if (yqb.size() < B * in_dim)  yqb.resize(B * in_dim);    // B rows of fixed-point acts
     if (accb.size() < B * out_dim) accb.resize(B * out_dim);  // B rows of int accumulators
 
     for (std::size_t r0 = 0; r0 < rows; r0 += B) {
       const std::size_t bn = std::min(B, rows - r0);
-      for (std::size_t j = 0; j < bn; ++j) {
+      // RMSNorm + quant the bn rows in parallel (rows independent; each row's sumsq
+      // reduction stays serial -> bit-identical to single-threaded). The shared y_buf
+      // can't be used across threads, so each worker uses its own thread_local scratch.
+      parallel_rows(bn, [&](std::size_t j) {
+        thread_local std::vector<float> ythr;
+        if (ythr.size() < in_dim) ythr.resize(in_dim);
+        float* yj = ythr.data();
         const float* xr = x + (r0 + j) * in_dim;
-        // RMSNorm into y (fp32 reduction).
+        // RMSNorm into yj (fp32 reduction).
         float sumsq = simd::sumsq(xr, in_dim);
         float rstd = 1.0f / std::sqrt(sumsq / static_cast<float>(in_dim) + eps);
-        for (std::size_t c = 0; c < in_dim; ++c) y[c] = xr[c] * rstd * norm_weight[c];
+        for (std::size_t c = 0; c < in_dim; ++c) yj[c] = xr[c] * rstd * norm_weight[c];
         if (norm_out) {
           float* nr = norm_out + (r0 + j) * in_dim;
-          for (std::size_t c = 0; c < in_dim; ++c) nr[c] = y[c];
+          for (std::size_t c = 0; c < in_dim; ++c) nr[c] = yj[c];
         }
-        // Quantize y -> int16 fixed point (round-half-to-even, saturate); SIMD,
+        // Quantize yj -> int16 fixed point (round-half-to-even, saturate); SIMD,
         // bit-exact vs the scalar nearbyint+clamp.
-        simd::quant_q510(yqb.data() + j * in_dim, y, qs, in_dim);
-      }
+        simd::quant_q510(yqb.data() + j * in_dim, yj, qs, in_dim);
+      });
       backend->matmul_batch(proj_id, yqb.data(), accb.data(), wq, in_dim, out_dim, bn);
-      for (std::size_t j = 0; j < bn; ++j)
+      // Dequant the bn output rows in parallel (independent, elementwise).
+      parallel_rows(bn, [&](std::size_t j) {
         simd::dequant_scale(out + (r0 + j) * out_dim, accb.data() + j * out_dim, inv_fixed,
                             out_dim);
+      });
     }
   } else {
     // Float (triton): signed float accumulation, no activation rounding. Per-row (no
@@ -101,10 +116,6 @@ void bitlinear_cluster(float* const* outs, const float* x, const float* const* n
   const float qs = static_cast<float>(1u << frac_bits);  // 2^frac_bits
   const std::size_t B = std::max<std::size_t>(1, backend->batch_size());
 
-  // Per-row RMSNorm scratch, reused across produce calls (single model thread).
-  thread_local std::vector<float> y;
-  if (y.size() < in_dim) y.resize(in_dim);
-
   // Chunk `rows` into the backend's batch B, exactly as bitlinear() does; the k
   // projections pipeline within each chunk.
   for (std::size_t r0 = 0; r0 < rows; r0 += B) {
@@ -113,19 +124,25 @@ void bitlinear_cluster(float* const* outs, const float* x, const float* const* n
     // produce(j, xq): RMSNorm(x_row, norm_weights[j]) -> quant -> xq[bn*in_dim].
     // rstd depends only on x (shared across j), but recomputing it keeps this
     // bit-identical to bitlinear()'s per-row path and the cost is a NEON reduction.
+    // Row-parallel; per-thread RMSNorm scratch (a shared thread_local can't cross the
+    // worker threads — see rmsnorm_swishgate).
     auto produce = [&](int j, std::int32_t* xq) {
-      for (std::size_t i = 0; i < bn; ++i) {
+      parallel_rows(bn, [&](std::size_t i) {
+        thread_local std::vector<float> ythr;
+        if (ythr.size() < in_dim) ythr.resize(in_dim);
+        float* y = ythr.data();
         const float* xr = x + (r0 + i) * in_dim;
         float sumsq = simd::sumsq(xr, in_dim);
         float rstd = 1.0f / std::sqrt(sumsq / static_cast<float>(in_dim) + eps);
         for (std::size_t c = 0; c < in_dim; ++c) y[c] = xr[c] * rstd * norm_weights[j][c];
-        simd::quant_q510(xq + i * in_dim, y.data(), qs, in_dim);
-      }
+        simd::quant_q510(xq + i * in_dim, y, qs, in_dim);
+      });
     };
     auto consume = [&](int j, const std::int32_t* acc) {
       const float inv_fixed = 1.0f / (qs * scale_w[j]);
-      for (std::size_t i = 0; i < bn; ++i)
+      parallel_rows(bn, [&](std::size_t i) {
         simd::dequant_scale(outs[j] + (r0 + i) * out_dim, acc + i * out_dim, inv_fixed, out_dim);
+      });
     };
 
     backend->matmul_seq(proj_ids, wqs, k, produce, consume, in_dim, out_dim, bn);
