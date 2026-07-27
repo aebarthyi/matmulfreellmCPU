@@ -47,6 +47,24 @@ struct TernaryBackend {
       matmul(proj_id, x + i * N, acc + i * M, wq, N, M);
   }
 
+  // As matmul_batch, but the backend may report completion in COLUMN RANGES as they become
+  // available instead of only at the end: on_cols(col0, ncols) says acc[i*M + col0 ..
+  // col0+ncols) is final for every row i. A backend that computes the projection in output-
+  // column pieces (the FPGA splits it into column tiles) calls this DURING the projection,
+  // so the caller's per-column work — dequant here, elementwise ops later — runs while the
+  // engine is still busy on the next piece instead of after the whole projection.
+  //
+  // The default is one call covering [0,M) after the whole matmul, i.e. exactly the
+  // un-chunked behaviour, so CpuBackend and any non-overriding backend are unchanged. The
+  // callback must be invoked for every column exactly once, whatever the piece order.
+  virtual void matmul_batch_chunked(int proj_id, const std::int32_t* x, std::int32_t* acc,
+                                    const std::int8_t* wq, std::size_t N, std::size_t M,
+                                    std::size_t b,
+                                    const std::function<void(std::size_t, std::size_t)>& on_cols) {
+    matmul_batch(proj_id, x, acc, wq, N, M, b);
+    if (on_cols) on_cols(0, M);
+  }
+
   // Run k projections that share dims (N,M,b) as a CLUSTER (e.g. i/f/g, all reading
   // the same RMSNorm input). For each j in [0,k): produce(j, xq) fills b*N int32
   // activations for projection j, the backend accumulates acc[b*M], then

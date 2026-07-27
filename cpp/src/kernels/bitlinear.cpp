@@ -76,12 +76,21 @@ void bitlinear(float* out, const float* x, const float* norm_weight, const int8_
         // bit-exact vs the scalar nearbyint+clamp.
         simd::quant_q510(yqb.data() + j * in_dim, yj, qs, in_dim);
       });
-      backend->matmul_batch(proj_id, yqb.data(), accb.data(), wq, in_dim, out_dim, bn);
-      // Dequant the bn output rows in parallel (independent, elementwise).
-      parallel_rows(bn, [&](std::size_t j) {
-        simd::dequant_scale(out + (r0 + j) * out_dim, accb.data() + j * out_dim, inv_fixed,
-                            out_dim);
-      });
+      // Dequant per COLUMN RANGE rather than after the whole projection. Dequant is
+      // elementwise, so a column range can be finished the moment the backend has it — and
+      // an offloading backend calls back while the engine is still computing the next
+      // range, which puts this work inside the engine's wait window instead of after it.
+      // The default backend fires one callback over [0,M) after the matmul, so the CPU path
+      // is unchanged and the arithmetic is bit-identical either way (each element is scaled
+      // exactly once, order-independent).
+      backend->matmul_batch_chunked(
+          proj_id, yqb.data(), accb.data(), wq, in_dim, out_dim, bn,
+          [&](std::size_t col0, std::size_t ncols) {
+            parallel_rows(bn, [&](std::size_t j) {
+              simd::dequant_scale(out + (r0 + j) * out_dim + col0,
+                                  accb.data() + j * out_dim + col0, inv_fixed, ncols);
+            });
+          });
     }
   } else {
     // Float (triton): signed float accumulation, no activation rounding. Per-row (no

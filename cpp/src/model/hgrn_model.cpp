@@ -348,7 +348,8 @@ std::vector<std::int64_t> Model::generate(const std::vector<std::int64_t>& ids,
 
 std::vector<std::vector<std::int64_t>> Model::generate_serve(
     const std::vector<std::vector<std::int64_t>>& prompts, std::size_t new_tokens,
-    std::int64_t eos_id, const Sampling& samp) {
+    std::int64_t eos_id, const Sampling& samp,
+    const std::function<void(std::size_t, std::int64_t)>& on_token) {
   const std::size_t H = cfg_.hidden_size;
   const std::size_t V = cfg_.vocab_size;
   const std::size_t L = cfg_.num_hidden_layers;
@@ -422,6 +423,7 @@ std::vector<std::vector<std::int64_t>> Model::generate_serve(
     run_proj("lm_head", logitsB.data(), finalnorm_.data(), 1);
     std::int64_t t0 = sample_row(logitsB.data(), b);
     streams[b].push_back(t0);
+    if (on_token) on_token(b, t0);
     if (t0 == eos_id) done[b] = 1;
   }
   if (new_tokens <= 1) return streams;
@@ -442,6 +444,7 @@ std::vector<std::vector<std::int64_t>> Model::generate_serve(
       if (done[b]) continue;
       std::int64_t t = sample_row(logitsB.data() + b * V, b);
       streams[b].push_back(t);
+      if (on_token) on_token(b, t);
       if (t == eos_id) done[b] = 1;
       else all_done = false;
     }

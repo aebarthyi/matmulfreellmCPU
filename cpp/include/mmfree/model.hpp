@@ -57,9 +57,17 @@ class Model {
   // stream that emits eos_id stops growing but keeps its batch slot. `new_tokens` is the
   // count generated per stream. With B identical prompts + greedy, all streams must match
   // each other and a single-stream generate() — the serving correctness check.
+  //
+  // `on_token(stream, id)` (optional) fires as each token is produced, mirroring
+  // generate()'s streaming hook but tagged with the stream it belongs to. Prefill runs
+  // stream-by-stream, so the B first-token callbacks arrive staggered — which is exactly
+  // what a serving TTFT measurement needs: stream 0's fires after one prompt's prefill,
+  // stream B-1's when the whole prefill phase is done and batched decode can start.
+  // Decode steps then fire one callback per live stream per step.
   std::vector<std::vector<std::int64_t>> generate_serve(
       const std::vector<std::vector<std::int64_t>>& prompts, std::size_t new_tokens,
-      std::int64_t eos_id = -1, const Sampling& samp = {});
+      std::int64_t eos_id = -1, const Sampling& samp = {},
+      const std::function<void(std::size_t, std::int64_t)>& on_token = {});
 
   const Config& config() const { return cfg_; }
 
