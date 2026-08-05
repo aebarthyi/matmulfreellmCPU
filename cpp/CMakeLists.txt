@@ -7,7 +7,25 @@ if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE Release)
 endif()
 # NOTE: no -ffast-math -- it reorders fp reductions and breaks the "matches triton" check.
-set(CMAKE_CXX_FLAGS_RELEASE "-O2")
+# (It would also change quant_q510's int16 output and therefore the engine's int32
+# accumulators, breaking the CPU==FPGA gate. Keep it out of MMFREE_OPT_FLAGS too.)
+#
+# Optimization flags live in a CACHE variable so they can be A/B'd from the command line
+# without editing this file — the kernels here are ~50% of FPGA-offload wall time, so the
+# flags matter more than they look:
+#   cmake -DMMFREE_OPT_FLAGS="-O3 -mcpu=cortex-a53" ...
+# DEFAULT RAISED -O2 -> -O3 on 2026-07-30, measured not assumed. On the KRIA at 2.7B packed
+# b=4, -O3 together with -mcpu=cortex-a53 cut host CPU time 12.8% and lifted decode 4.6%
+# (29.56 -> 30.91 tok/s), with the CPU==FPGA gate PASSING on both arms — these flags keep IEEE
+# fp semantics, so quant_q510's int16s and hence the engine's int32 accumulators are identical.
+# Why -O2 was leaving throughput behind: it overrode CMake's own Release default of -O3, and at
+# -O2 GCC 13 uses -fvect-cost-model=very-cheap, which declines loops whose trip count is only
+# known at runtime -- e.g. the RMSNorm scale loop in bitlinear.cpp. -O3 switches to `dynamic`.
+# -mcpu is deliberately NOT set here: it is target-specific (the A53 is in-order dual-issue, so
+# pipeline-tuned scheduling matters), so the FPGA runner's Makefile adds -mcpu=cortex-a53 on
+# aarch64 and this file stays portable.
+set(MMFREE_OPT_FLAGS "-O3" CACHE STRING "optimization flags for Release builds (no -ffast-math)")
+set(CMAKE_CXX_FLAGS_RELEASE "${MMFREE_OPT_FLAGS}")
 add_compile_options(-Wall -Wextra)
 
 add_library(mmfreecpu STATIC
@@ -28,9 +46,12 @@ target_include_directories(mmfreecpu PUBLIC include)
 # down as a compile define (see include/mmfree/simd.hpp). Override with -DMMFREE_SIMD=...
 #   AUTO (default) -> detect from CMAKE_SYSTEM_PROCESSOR
 #   X86            -> AVX2 + FMA      (MMFREE_ARCH_X86)
+#   X86_512        -> AVX-512F/BW/DQ/VL + FMA (MMFREE_ARCH_X86; tq1.hpp then compiles its
+#                     512-bit ternary-dot paths, see MMFREE_AVX512 there). Host-specific:
+#                     only select it on a machine that has AVX-512.
 #   ARM            -> NEON            (MMFREE_ARCH_ARM)
 #   SCALAR         -> portable fallback (no define)
-set(MMFREE_SIMD "AUTO" CACHE STRING "SIMD backend: AUTO|X86|ARM|SCALAR")
+set(MMFREE_SIMD "AUTO" CACHE STRING "SIMD backend: AUTO|X86|X86_512|ARM|SCALAR")
 if(MMFREE_SIMD STREQUAL "AUTO")
   if(CMAKE_SYSTEM_PROCESSOR MATCHES "(x86_64|AMD64|i[3-6]86)")
     set(MMFREE_SIMD "X86")
@@ -45,6 +66,13 @@ message(STATUS "mmfree SIMD backend: ${MMFREE_SIMD} (CMAKE_SYSTEM_PROCESSOR=${CM
 if(MMFREE_SIMD STREQUAL "X86")
   target_compile_definitions(mmfreecpu PUBLIC MMFREE_ARCH_X86)
   target_compile_options(mmfreecpu PRIVATE -mavx2 -mfma)
+elseif(MMFREE_SIMD STREQUAL "X86_512")
+  target_compile_definitions(mmfreecpu PUBLIC MMFREE_ARCH_X86)
+  # PUBLIC, not PRIVATE: tq1.hpp is header-only and gates its 512-bit paths on __AVX512F__ /
+  # __AVX512BW__, so a consumer compiled without these flags would silently get the AVX2 path
+  # while this library got the 512-bit one -- the same incoherent-mix footgun the ARCH/SIMD
+  # split above already warns about.
+  target_compile_options(mmfreecpu PUBLIC -mavx512f -mavx512bw -mavx512dq -mavx512vl -mfma)
 elseif(MMFREE_SIMD STREQUAL "ARM")
   target_compile_definitions(mmfreecpu PUBLIC MMFREE_ARCH_ARM)
   # AArch64 has NEON in the baseline ISA (no flag needed). 32-bit ARM needs -mfpu=neon.
