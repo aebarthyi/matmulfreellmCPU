@@ -35,10 +35,14 @@ CLI        := $(BUILD)/mmfree-cli
 PROMPT     ?= In a shocking finding, scientists discovered
 GEN        ?= 32
 REPS       ?= 3
+# In-memory ternary weight format: int8 (default) | 1.6bit | 2bit. Lossless, so results are
+# bit-identical; the packed ones cut weight traffic per token ~5x/4x.
+WEIGHTS    ?=
 ARGS       ?=
 
 CMAKE_ARGS := -DCMAKE_BUILD_TYPE=$(BUILD_TYPE) -DMMFREE_TUNE_NATIVE=$(TUNE) \
               $(if $(SIMD),-DMMFREE_SIMD=$(SIMD),)
+CLI_ARGS   := $(if $(WEIGHTS),--weights $(WEIGHTS),) $(ARGS)
 
 .PHONY: all build configure model run bench profile test smoke install clean distclean help
 
@@ -69,27 +73,27 @@ model:
 # ─── run ─────────────────────────────────────────────────────────────────────────
 run: build
 	@[ -f "$(BLOB)" ] || { echo "ERROR: no weight blob at $(BLOB) — run 'make model' first (or pass BLOB=<path>)." >&2; exit 1; }
-	$(CLI) --blob $(BLOB) --gen $(GEN) $(ARGS) "$(PROMPT)"
+	$(CLI) --blob $(BLOB) --gen $(GEN) $(CLI_ARGS) "$(PROMPT)"
 
 bench: build
 	@[ -f "$(BLOB)" ] || { echo "ERROR: no weight blob at $(BLOB) — run 'make model' first (or pass BLOB=<path>)." >&2; exit 1; }
-	$(CLI) --blob $(BLOB) --bench --gen $(GEN) --reps $(REPS) $(ARGS)
+	$(CLI) --blob $(BLOB) --bench --gen $(GEN) --reps $(REPS) $(CLI_ARGS)
 
 profile: build
 	@[ -f "$(BLOB)" ] || { echo "ERROR: no weight blob at $(BLOB) — run 'make model' first (or pass BLOB=<path>)." >&2; exit 1; }
-	$(CLI) --blob $(BLOB) --bench --profile --gen $(GEN) --reps $(REPS) $(ARGS)
+	$(CLI) --blob $(BLOB) --bench --profile --gen $(GEN) --reps $(REPS) $(CLI_ARGS)
 
 # ─── checks ──────────────────────────────────────────────────────────────────────
-# The golden-oracle ctest suite lives on the `validation` branch (cpp/tests/). Here on
-# main `make test` runs it if present and otherwise falls back to the build smoke test,
-# so the target is never a silent no-op.
+# ctest covers whatever this tree registers: the packed-weight kernels (cpp/tests/test_tq1)
+# on any branch, plus the golden-oracle suite on `validation`. The smoke test runs either
+# way, so the target is never a silent no-op.
 test: build
-	@if [ -f "$(SRC)/tests/test_kernels.cpp" ]; then \
+	@if [ -d "$(SRC)/tests" ]; then \
 	    cd $(BUILD) && ctest --output-on-failure; \
 	else \
-	    echo "# no cpp/tests/ on this branch (they live on \`validation\`) — running the smoke test"; \
-	    $(MAKE) --no-print-directory smoke; \
+	    echo "# no cpp/tests/ in this tree — smoke test only"; \
 	fi
+	@$(MAKE) --no-print-directory smoke
 
 # Proves the binary links and runs. Generation is included only if a blob is present,
 # so this works on a machine that has not provisioned a checkpoint.
@@ -127,6 +131,7 @@ help:
 	@echo '  MODEL=$(MODEL)'
 	@echo '  PROMPT=$(PROMPT)'
 	@echo '  GEN=$(GEN)   REPS=$(REPS)   JOBS=$(JOBS)'
+	@echo '  WEIGHTS=$(if $(WEIGHTS),$(WEIGHTS),int8)          # int8|1.6bit|2bit (packed = same results, less traffic)'
 	@echo '  BUILD=$(BUILD)   BUILD_TYPE=$(BUILD_TYPE)'
 	@echo '  SIMD=$(if $(SIMD),$(SIMD),<auto-detect>)   # SCALAR|X86|X86_512|ARM'
 	@echo '  TUNE=$(TUNE)                # ON = -mtune/-mcpu=native (host-tuned scheduling)'
@@ -137,5 +142,6 @@ help:
 	@echo 'examples:'
 	@echo '  make -j && make model && make run PROMPT="Once upon a time,"'
 	@echo '  make bench GEN=128 REPS=5'
+	@echo '  make bench WEIGHTS=2bit           # compare against WEIGHTS=int8'
 	@echo '  make build SIMD=SCALAR BUILD=/tmp/b   # portable binary, out-of-tree'
 	@echo '  make model MODEL=ridger/MMfreeLM-1.3B'

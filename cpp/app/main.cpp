@@ -16,6 +16,7 @@
 #include "mmfree/model.hpp"
 #include "mmfree/profile.hpp"
 #include "mmfree/tokenizer.hpp"
+#include "mmfree/tq1.hpp"  // Tq1Backend / Tq2Backend: --weights 1.6bit|2bit
 #include "mmfree/weights.hpp"
 
 #include <cctype>
@@ -61,6 +62,13 @@ generation
 numerics
   --mode float|fixed activation numerics (default fixed = the Q5.10 FPGA datapath)
   --frac N           fixed-point fraction bits              (default 10)
+  --weights FMT      in-memory ternary weight format        (default int8)
+                       int8    one int8 per weight, straight from the blob
+                       1.6bit  TQ1_0 base-3 packing, 5 trits/byte (1.625 bits/weight)
+                       2bit    2 bits/weight
+                     The packed formats are lossless, so results are bit-identical to int8;
+                     they trade a one-off repack at first use for ~5x/4x less weight traffic
+                     per token. `fixed` mode only (float mode ignores this).
 
 output / validation
   --print-ids        print the full id stream instead of decoded text
@@ -141,7 +149,7 @@ static std::string default_tokenizer_path(const std::string& blob) {
 }
 
 static int run(int argc, char** argv) {
-  std::string blob, tokenizer_path, mode = "fixed", ids_arg, logits_out;
+  std::string blob, tokenizer_path, mode = "fixed", ids_arg, logits_out, wfmt = "int8";
   std::string prompt, decode_arg;
   bool have_prompt = false, no_bos = false, no_eos = false, print_ids = false,
        show_ids = false, bench = false, profile = false;
@@ -157,6 +165,7 @@ static int run(int argc, char** argv) {
     if (k == "--blob") blob = next();
     else if (k == "--tokenizer") tokenizer_path = next();
     else if (k == "--mode") mode = next();
+    else if (k == "--weights") wfmt = next();
     else if (k == "--frac") frac = std::atoi(next());
     else if (k == "--gen") gen = static_cast<std::size_t>(std::atoll(next()));
     else if (k == "--temp" || k == "--temperature") samp.temperature = std::atof(next());
@@ -181,6 +190,18 @@ static int run(int argc, char** argv) {
       prompt = k;  // first positional = prompt text
       have_prompt = true;
     }
+  }
+
+  // Validate the enum-valued flags before touching a multi-GB blob. `--mode` in particular
+  // used to accept anything and silently mean "float", which quietly changes the numerics.
+  if (mode != "fixed" && mode != "float") {
+    std::fprintf(stderr, "error: unknown --mode %s (expected fixed or float)\n", mode.c_str());
+    return 2;
+  }
+  if (wfmt != "int8" && wfmt != "1.6bit" && wfmt != "2bit") {
+    std::fprintf(stderr, "error: unknown --weights %s (expected int8, 1.6bit, or 2bit)\n",
+                 wfmt.c_str());
+    return 2;
   }
 
   // Resolve the model files: explicit flag > environment > search. Report a miss here
@@ -268,6 +289,39 @@ static int run(int argc, char** argv) {
   if (gen > 0 || !logits_out.empty() || bench) {
     w = std::make_unique<Weights>(blob);
     model = std::make_unique<Model>(*w, aq, frac);
+  }
+
+  // ---- --weights: install a packed ternary backend (mmfree/tq1.hpp) ----------------
+  // These repack each projection from the blob's int8 on first touch and cache it keyed on
+  // the mmap'd pointer, so the one-off cost lands on the first token — which --warmup
+  // absorbs in --bench. The packing is lossless and integer addition is associative, so
+  // the int32 accumulators, and therefore the logits, are bit-identical to int8 (proved
+  // over the whole input domain by cpp/tests/test_tq1.cpp). No blob change is involved:
+  // the same model.mmfree serves all three formats.
+  // set_backend's proj_ids map stays empty — it exists for backends with resident
+  // per-projection weights (the FPGA); the CPU backends ignore proj_id.
+  std::unique_ptr<Tq1Backend> tq1;
+  std::unique_ptr<Tq2Backend> tq2;
+  if (model && wfmt != "int8") {
+    if (aq != ActQuant::FixedQ510) {
+      // bitlinear only consults the backend on the integer path, so honouring --weights
+      // here would be a lie. Say so instead of silently running int8.
+      std::fprintf(stderr, "warning: --weights %s is ignored in --mode float "
+                           "(the packed kernels are integer-only); using int8\n",
+                   wfmt.c_str());
+    } else if (wfmt == "1.6bit") {
+      tq1 = std::make_unique<Tq1Backend>();
+      model->set_backend(tq1.get(), {});
+      std::fprintf(stderr, "weight format: %s, %.4f bits/weight (%zu-weight blocks, %zu B)\n",
+                   Tq1Backend::format_name(), Tq1Backend::format_bits(),
+                   tq1::kBlockElems, tq1::kBlockBytes);
+    } else {  // 2bit
+      tq2 = std::make_unique<Tq2Backend>();
+      model->set_backend(tq2.get(), {});
+      std::fprintf(stderr, "weight format: %s, %.4f bits/weight (%zu-weight blocks, %zu B)\n",
+                   Tq2Backend::format_name(), Tq2Backend::format_bits(),
+                   tq2::kBlockElems, tq2::kBlockBytes);
+    }
   }
 
   // ---- benchmark mode: time generation, report prefill/decode tok/s, then exit ----

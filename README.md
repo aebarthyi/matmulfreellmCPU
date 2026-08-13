@@ -136,6 +136,38 @@ Sampling is greedy by default (deterministic); `--temp`/`--top-k`/`--seed` switc
 sampling. `--mode float|fixed` selects the activation numerics — the default `fixed` is the
 Q5.10 integer datapath that mirrors the FPGA accelerator.
 
+### Packed ternary weights
+
+The blob stores one `int8` per ternary weight, which is 4-5x more weight traffic per token
+than the values need. `--weights` picks a denser in-memory format instead:
+
+```sh
+mmfree-cli --bench --gen 128 --weights 1.6bit    # TQ1_0, 5 trits/byte -> 1.625 bits/weight
+mmfree-cli --bench --gen 128 --weights 2bit      # 2.0 bits/weight
+mmfree-cli --bench --gen 128                     # int8, 8.0 bits/weight (default)
+```
+
+Both packed formats are **lossless**, so this is a pure speed/space knob: the round trip
+preserves every ternary value and integer addition is associative, so the int32 accumulators
+— and therefore the logits — are **bit-identical to `int8`**. Verified two ways:
+`cpp/tests/test_tq1.cpp` proves the encoding exhaustively over its whole input domain (all
+243 five-trit and 81 four-trit groups, not a sample), and all three formats produce
+byte-identical logits from the 370M model.
+
+Mechanics: nothing changes about provisioning — the same `model.mmfree` serves all three.
+Each projection is repacked from the blob's `int8` on first touch and cached, so the one-off
+cost lands on the first token (`--warmup` absorbs it under `--bench`). Resident heap is
+1.625/8 or 2/8 of the `int8` size (370M ≈ 69/85 MB, 2.7B ≈ 532/656 MB), against which the
+`int8` mmap pages go cold and become evictable — for the large models this can *lower*
+steady-state RSS. Projections whose inner dimension isn't a multiple of 256 fall back to the
+`int8` kernel automatically (every real MMfreeLM shape is a multiple). Integer path only:
+`--mode float` ignores `--weights` and says so.
+
+Which is faster depends on the machine — packing trades memory traffic for extraction work,
+so it wins where the matmul is bandwidth-bound and loses where it is ALU-bound (on a
+Cortex-A53 the 1.6-bit path measured *slower* than `int8`). Benchmark both on the target
+rather than assuming: `make bench WEIGHTS=2bit` against `make bench`.
+
 With no `--blob`, the engine looks for `model.mmfree` in the working directory, then beside
 the executable and its parent directories, so both `cd cpp && ./build/mmfree-cli` and
 `./cpp/build/mmfree-cli` from the repo root just work. `$MMFREE_BLOB` / `$MMFREE_TOKENIZER`
@@ -169,14 +201,25 @@ hardware backend be checked against the CPU bit-for-bit.
 
 ## Validation
 
-`main` is the lean engine. The correctness suite — the C++ `ctest` tests (`test_kernels`,
-`test_e2e`) plus the PyTorch-comparison tooling that generates their golden oracles
-(`dump_golden.py`, `compare_prompts.py`, `check_tokenizer.py`, …) — lives on the
-**`validation`** branch:
+`make test` runs whatever this tree registers with `ctest`, then a smoke test:
 
 ```sh
-git checkout validation   # adds cpp/tests/ + the tools/ comparison scripts
-make test                 # ctest here; on main it falls back to a build smoke test
+make test          # here: cpp/tests/test_tq1 (packed-weight kernels) + smoke
+./cpp/build/test_tq1 --bench    # the same checks plus a kernel throughput report
+```
+
+`test_tq1` needs no model blob and no hardware, and it exercises whichever SIMD path the
+library was built for — so it is also the check that a new platform's NEON/AVX-512
+extraction is right.
+
+The **model-level** correctness suite — `test_kernels` and `test_e2e` plus the
+PyTorch-comparison tooling that generates their golden oracles (`dump_golden.py`,
+`compare_prompts.py`, `check_tokenizer.py`, …) — lives on the **`validation`** branch,
+because the oracles and their torch dependency are far larger than the engine:
+
+```sh
+git checkout validation   # adds the golden-oracle tests + tools/ comparison scripts
+make test                 # same command, more tests
 ```
 
 It was verified end-to-end: the C++ output matches the PyTorch reference exactly in both the

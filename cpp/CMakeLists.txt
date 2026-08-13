@@ -185,11 +185,21 @@ install(TARGETS mmfree-cli mmfreecpu
         ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR})
 install(DIRECTORY include/mmfree DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
 
-# Validation tests live on the `validation` branch (with the golden-oracle tooling
-# in tools/). They build only when tests/ is present, so this same CMakeLists works
-# on the lean `main` branch (engine only) and on `validation` (engine + tests).
+enable_testing()
+
+# Kernel self-tests that need no model blob and no oracles — always available.
+# test_tq1 links mmfreecpu purely to inherit its PUBLIC arch flags, so it exercises the
+# same extraction path (AVX-512 / AVX2 / NEON / scalar) the library was built for.
+if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_tq1.cpp)
+  add_executable(test_tq1 tests/test_tq1.cpp)
+  target_link_libraries(test_tq1 PRIVATE mmfreecpu)
+  add_test(NAME tq1 COMMAND test_tq1)
+endif()
+
+# The golden-oracle tests live on the `validation` branch (with the tooling in tools/ that
+# generates them). They build only when their sources are present, so this same CMakeLists
+# works on the lean `main` branch and on `validation`.
 if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_kernels.cpp)
-  enable_testing()
   add_executable(test_kernels tests/test_kernels.cpp)
   target_link_libraries(test_kernels PRIVATE mmfreecpu)
   target_include_directories(test_kernels PRIVATE tests)
