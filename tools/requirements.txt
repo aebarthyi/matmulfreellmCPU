@@ -4,10 +4,23 @@
 #   provision.py   HF download + model.mmfree (weights) + tokenizer.mmtok
 #   reference.py   PyTorch quant/reference used by the weight packer
 #
+# Imports are lazy, so you only need what your path uses:
+#   --tokenizer-only          stdlib only (nothing here)
+#   --no-torch                numpy + huggingface_hub
+#   default (weight packer)   everything below
+#
+# On a machine where installing torch is the obstacle, `provision.py --no-torch` packs
+# with numpy alone: the ternary weights come out bit-identical, only the per-tensor
+# scale_w floats can shift by 1-2 ULP (see provision.py's docstring). The torch path is
+# the numerics of record — prefer it when reproducing the reference exactly.
+#
+# A CPU-only torch is enough and much smaller than the default CUDA build:
+#   pip install torch --index-url https://download.pytorch.org/whl/cpu
+#
 # The PyTorch/Triton model and the comparison/test tooling were split out — the
 # validation harness (golden-oracle dump, prompt comparison, cpp ctest suite) lives
 # on the `validation` branch, which adds its own extra deps (e.g. transformers).
-torch
-safetensors
 numpy
 huggingface_hub
+safetensors      # used by reference.py (torch path); --no-torch reads the file directly
+torch            # optional: skip it and pass --no-torch to provision.py

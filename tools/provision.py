@@ -18,9 +18,18 @@ Usage:
   python tools/provision.py --out-dir /path/to/cpp
   python tools/provision.py --skip-download                   # checkpoint already cached
   python tools/provision.py --weights-only | --tokenizer-only # one artifact
+  python tools/provision.py --no-torch                        # pack with numpy only
 
 Gated/private repos: run `huggingface-cli login` first (the 370M model is public).
-torch is imported lazily — `--tokenizer-only` needs only the stdlib.
+Imports are lazy, so each path installs only what it uses: `--tokenizer-only` needs the
+stdlib, `--no-torch` needs numpy, the default weight packer needs torch.
+
+--no-torch trades an exact match for a much smaller dependency: it reads the safetensors
+file directly and does the quant in numpy. Measured on all 145 ternary tensors of
+MMfreeLM-370M, the ternary weights are BIT-IDENTICAL to the torch path; only the
+per-tensor `scale_w` floats can differ in the last 1-2 ULP, because numpy and torch sum
+`mean(|W|)` in a different order. Use the default torch path when reproducing the
+reference numerics exactly; --no-torch when installing torch is the obstacle.
 """
 from __future__ import annotations
 
@@ -77,51 +86,175 @@ def download(model: str) -> str:
     return path
 
 
-# ── 2. pack weights (needs torch; imported lazily) ───────────────────────────
-def pack_weights(out: str, model: str = DEFAULT_MODEL) -> str:
+# ── 2. pack weights ──────────────────────────────────────────────────────────
+# The packer works on numpy fp32 arrays; a small backend supplies them plus the ternary
+# quant, so the same packing code serves both the torch reference path and --no-torch.
+class _TorchBackend:
+    """Reference path: tools/reference.py (torch) loads and quantizes. This is the
+    numerics of record — the golden oracles were generated through it."""
+    name = "torch"
+
+    def __init__(self, model: str):
+        import torch  # noqa: F401  (reference loads torch tensors)
+        from reference import load_reference, weight_quant_int
+        self._quant_fn = weight_quant_int
+        ref, self.cfg, self.ckpt = load_reference(model)
+        self._sd = ref.sd
+
+    def f32(self, key: str):
+        import numpy as np
+        return np.ascontiguousarray(self._sd[key].detach().cpu().numpy().astype(np.float32))
+
+    def quant(self, key: str):
+        import numpy as np
+        wq, scale = self._quant_fn(self._sd[key])
+        return (np.ascontiguousarray(wq.detach().cpu().numpy().astype(np.int8)),
+                np.float32(scale.item()))
+
+    def lower_bounds(self):
+        import numpy as np
+        lb = self._sd["model.lower_bounds"].softmax(0)
+        lb = lb.cumsum(0) - lb[0]
+        return np.ascontiguousarray(lb.detach().cpu().numpy().astype(np.float32))
+
+
+class _NumpyBackend:
+    """torch-free path (--no-torch): reads the safetensors file itself and quantizes in
+    numpy. See the module docstring for exactly how far this diverges from _TorchBackend
+    (ternary weights identical; scale_w within 1-2 ULP)."""
+    name = "numpy"
+
+    def __init__(self, model: str):
+        import numpy as np
+        self._np = np
+        self.ckpt = _resolve_checkpoint(model)
+        self.cfg = _NumpyConfig.from_json(os.path.join(self.ckpt, "config.json"))
+        self._sd = {}
+        for f in sorted(glob.glob(os.path.join(self.ckpt, "*.safetensors"))):
+            self._sd.update(_read_safetensors_f32(f))
+        if not self._sd:
+            raise FileNotFoundError(f"no *.safetensors in {self.ckpt}")
+
+    def f32(self, key: str):
+        return self._np.ascontiguousarray(self._sd[key], dtype=self._np.float32)
+
+    def quant(self, key: str):
+        # Mirrors reference.weight_quant_int: scale = 1/mean(|W|) (clamped), then
+        # round-half-to-even to {-1,0,+1}. np.rint and torch.round are both
+        # round-half-to-even, so the ternary result is identical; only the fp32
+        # summation order inside mean() can differ.
+        np = self._np
+        w = self._sd[key]
+        scale = np.float32(1.0) / np.maximum(np.abs(w).mean(dtype=np.float32),
+                                             np.float32(1e-5))
+        wq = np.clip(np.rint(w * scale), -1, 1).astype(np.int8)
+        return np.ascontiguousarray(wq), np.float32(scale)
+
+    def lower_bounds(self):
+        np = self._np
+        x = self._sd["model.lower_bounds"].astype(np.float32)
+        e = np.exp(x - x.max(axis=0, keepdims=True))       # softmax over dim 0
+        lb = e / e.sum(axis=0, keepdims=True)
+        lb = np.cumsum(lb, axis=0) - lb[0]
+        return np.ascontiguousarray(lb, dtype=np.float32)
+
+
+class _NumpyConfig:
+    """Torch-free mirror of reference.HGRNBitConfig (same fields and inter_size rule)."""
+    _DEFAULTS = dict(vocab_size=32000, hidden_size=1024, num_hidden_layers=24, num_heads=1,
+                     expand_ratio=1, hidden_ratio=4, intermediate_size=None,
+                     use_short_conv=False, conv_size=4, use_lower_bound=True,
+                     rms_norm_eps=1e-6)
+
+    def __init__(self, **kw):
+        for k, v in self._DEFAULTS.items():
+            setattr(self, k, kw.get(k, v) if kw.get(k, v) is not None else v)
+        self.intermediate_size = kw.get("intermediate_size")  # may legitimately be None
+
+    @classmethod
+    def from_json(cls, path: str) -> "_NumpyConfig":
+        with open(path) as f:
+            d = json.load(f)
+        return cls(**{k: d[k] for k in cls._DEFAULTS if k in d})
+
+    @property
+    def inter_size(self) -> int:
+        if self.intermediate_size is not None:
+            return self.intermediate_size
+        i = int(self.hidden_size * self.hidden_ratio * 2 / 3)
+        return 256 * ((i + 256 - 1) // 256)
+
+
+def _read_safetensors_f32(path: str) -> dict:
+    """Minimal safetensors reader -> {name: fp32 ndarray}. BF16 is widened by shifting
+    into the high half of an fp32 (exact, same as torch's .float()); F16/F32 convert
+    directly. Everything else is rejected rather than guessed at."""
+    import numpy as np
+    with open(path, "rb") as f:
+        header_len = struct.unpack("<Q", f.read(8))[0]
+        header = json.loads(f.read(header_len))
+    base = 8 + header_len
+    blob = np.memmap(path, dtype=np.uint8, mode="r")
+    out = {}
+    for name, meta in header.items():
+        if name == "__metadata__":
+            continue
+        start, end = meta["data_offsets"]
+        raw = blob[base + start: base + end]
+        dtype = meta["dtype"]
+        if dtype == "BF16":
+            arr = (raw.view(np.uint16).astype(np.uint32) << 16).view(np.float32)
+        elif dtype == "F32":
+            arr = raw.view(np.float32).astype(np.float32)
+        elif dtype == "F16":
+            arr = raw.view(np.float16).astype(np.float32)
+        else:
+            raise ValueError(f"{name}: unsupported safetensors dtype {dtype!r} "
+                             f"(--no-torch handles BF16/F16/F32); drop --no-torch")
+        out[name] = arr.reshape(meta["shape"])
+    return out
+
+
+def pack_weights(out: str, model: str = DEFAULT_MODEL, no_torch: bool = False) -> str:
     """Quantize + pack `model`'s checkpoint into `out` (model.mmfree). The checkpoint
     must already be in the HF cache (download() above). Returns the output path."""
     import numpy as np
-    import torch  # noqa: F401  (reference loads torch tensors)
-    from reference import load_reference, weight_quant_int
 
     out = os.path.abspath(out)
-    ref, cfg, ckpt = load_reference(model)
-    print(f"loaded checkpoint: {ckpt}")
-    sd = ref.sd
+    be = (_NumpyBackend if no_torch else _TorchBackend)(model)
+    cfg = be.cfg
+    print(f"loaded checkpoint: {be.ckpt}  (packer backend: {be.name})")
 
     tensors: dict = {}
 
-    def add_f32(name, t):
-        tensors[name] = ("f32", np.ascontiguousarray(t.detach().cpu().numpy().astype(np.float32)))
+    def add_f32(name, arr):
+        tensors[name] = ("f32", np.ascontiguousarray(arr, dtype=np.float32))
 
-    def add_i8(name, t):
-        tensors[name] = ("i8", np.ascontiguousarray(t.detach().cpu().numpy().astype(np.int8)))
+    def add_i8(name, arr):
+        tensors[name] = ("i8", np.ascontiguousarray(arr, dtype=np.int8))
+
+    def add_proj(tag, key):
+        """One ternary projection: int8 weights + its per-tensor scale + norm weight."""
+        wq, scale_w = be.quant(f"{key}.weight")
+        add_i8(f"{tag}.wq", wq)
+        add_f32(f"{tag}.scale_w", np.asarray(scale_w, dtype=np.float32).reshape(1))
+        add_f32(f"{tag}.normw", be.f32(f"{key}.norm.weight"))
 
     # global: embeddings, final norm, lm_head (ternary), lower_bounds (precomputed)
-    add_f32("model.embeddings", sd["model.embeddings.weight"])
-    add_f32("model.norm.w", sd["model.norm.weight"])
-    wq, scale_w = weight_quant_int(sd["lm_head.weight"])
-    add_i8("lm_head.wq", wq)
-    add_f32("lm_head.scale_w", scale_w.reshape(1))
-    add_f32("lm_head.normw", sd["lm_head.norm.weight"])
+    add_f32("model.embeddings", be.f32("model.embeddings.weight"))
+    add_f32("model.norm.w", be.f32("model.norm.weight"))
+    add_proj("lm_head", "lm_head")
     if cfg.use_lower_bound:
-        lb = sd["model.lower_bounds"].softmax(0)
-        lb = lb.cumsum(0) - lb[0]
-        add_f32("lower_bounds", lb)  # [L, H]
+        add_f32("lower_bounds", be.lower_bounds())  # [L, H]
 
     # per-layer
     for l in range(cfg.num_hidden_layers):
         p = f"model.layers.{l}"
-        add_f32(f"{p}.attn_norm.w", sd[f"{p}.attn_norm.weight"])
-        add_f32(f"{p}.mlp_norm.w", sd[f"{p}.mlp_norm.weight"])
-        add_f32(f"{p}.g_norm.w", sd[f"{p}.attn.g_norm.weight"])
+        add_f32(f"{p}.attn_norm.w", be.f32(f"{p}.attn_norm.weight"))
+        add_f32(f"{p}.mlp_norm.w", be.f32(f"{p}.mlp_norm.weight"))
+        add_f32(f"{p}.g_norm.w", be.f32(f"{p}.attn.g_norm.weight"))
         for tag, infix in LAYER_PROJS:
-            w = sd[f"{p}.{infix}.weight"]
-            wq, scale_w = weight_quant_int(w)
-            add_i8(f"{p}.{tag}.wq", wq)
-            add_f32(f"{p}.{tag}.scale_w", scale_w.reshape(1))
-            add_f32(f"{p}.{tag}.normw", sd[f"{p}.{infix}.norm.weight"])
+            add_proj(f"{p}.{tag}", f"{p}.{infix}")
 
     # offsets (relative to data-section start), 64-byte aligned
     meta: dict = {}
@@ -231,6 +364,9 @@ def main() -> int:
                     help="use the already-cached checkpoint")
     ap.add_argument("--weights-only", action="store_true", help="pack only model.mmfree")
     ap.add_argument("--tokenizer-only", action="store_true", help="pack only tokenizer.mmtok")
+    ap.add_argument("--no-torch", action="store_true",
+                    help="pack the weights with numpy instead of torch (ternary weights "
+                         "identical, scale_w within 1-2 ULP — see the module docstring)")
     args = ap.parse_args()
     if args.weights_only and args.tokenizer_only:
         ap.error("--weights-only and --tokenizer-only are mutually exclusive")
@@ -254,7 +390,8 @@ def main() -> int:
     if do_weights:
         step += 1
         print(f"==> [{step}/{n}] packing weights -> model.mmfree", flush=True)
-        results.append(pack_weights(os.path.join(out_dir, "model.mmfree"), args.model))
+        results.append(pack_weights(os.path.join(out_dir, "model.mmfree"), args.model,
+                                    no_torch=args.no_torch))
     if do_tokenizer:
         step += 1
         print(f"==> [{step}/{n}] packing tokenizer -> tokenizer.mmtok", flush=True)
@@ -263,8 +400,8 @@ def main() -> int:
     print("\nDone. C++ inputs ready:")
     for r in results:
         print(f"  {r}")
-    print('Build + run:  cd cpp && cmake -B build && cmake --build build -j && '
-          './build/mmfree-cli "hello"')
+    print('Build + run:  make && make run PROMPT="hello"'
+          '   (or: cd cpp && cmake -B build && cmake --build build -j)')
     return 0
 
 

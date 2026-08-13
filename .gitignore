@@ -1,23 +1,30 @@
+# --- python tooling -------------------------------------------------------------
 __pycache__/
-tools/__pycache__/
-cpp/golden
-cpp/golden_fixedp
-cpp/build/
-*.json
-cpp/model.mmfree
-cpp/tokenizer.mmtok
+*.pyc
+.venv/
+
+# --- provisioned model artifacts (regenerate with tools/provision.py) -----------
 *.mmfree
 *.mmtok
-CMakeLists.txt.user
-CMakeCache.txt
-CMakeFiles
-CMakeScripts
-Testing
-Makefile
-cmake_install.cmake
-install_manifest.txt
-compile_commands.json
-CTestTestfile.cmake
-_deps
-CMakeUserPresets.json
+
+# --- golden oracles (generated on the `validation` branch) ----------------------
+cpp/golden
+cpp/golden_fixedp
+
+# --- build trees ----------------------------------------------------------------
+# Out-of-source (the documented layout: cpp/build/) and any other build dir.
 build/
+# ...and the litter an accidental in-source `cmake .` inside cpp/ leaves behind.
+# NOTE: anchored to cpp/. An unanchored `Makefile`/`CMakeFiles` here would also hide
+# this repo's own tracked root Makefile.
+/cpp/Makefile
+/cpp/CMakeCache.txt
+/cpp/CMakeFiles/
+/cpp/cmake_install.cmake
+/cpp/CTestTestfile.cmake
+/cpp/Testing/
+/cpp/install_manifest.txt
+CMakeLists.txt.user
+CMakeUserPresets.json
+compile_commands.json
+_deps

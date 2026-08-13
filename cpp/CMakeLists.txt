@@ -3,9 +3,26 @@ project(mmfreecpu CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
-if(NOT CMAKE_BUILD_TYPE)
-  set(CMAKE_BUILD_TYPE Release)
+if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
+  set(CMAKE_BUILD_TYPE Release CACHE STRING "" FORCE)
 endif()
+
+# Portability note: the engine targets POSIX (Linux, macOS, *BSD) on any CPU --
+# src/io/weights.cpp mmap()s the weight blob. On Windows, build under WSL.
+if(WIN32)
+  message(WARNING "mmfreecpu has not been ported to Win32 (src/io/weights.cpp uses mmap). "
+                  "Build under WSL, or port load_blob() to MapViewOfFile.")
+endif()
+
+# GCC/Clang vs MSVC: every flag below is a GNU-style one, so gate them on the compiler
+# rather than assuming. MSVC needs a different spelling for all of them (and would fail
+# the mmap check above first), so it only gets the warning level.
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang|IntelLLVM")
+  set(MMFREE_GNU_FLAGS ON)
+else()
+  set(MMFREE_GNU_FLAGS OFF)
+endif()
+
 # NOTE: no -ffast-math -- it reorders fp reductions and breaks the "matches triton" check.
 # (It would also change quant_q510's int16 output and therefore the engine's int32
 # accumulators, breaking the CPU==FPGA gate. Keep it out of MMFREE_OPT_FLAGS too.)
@@ -21,12 +38,22 @@ endif()
 # Why -O2 was leaving throughput behind: it overrode CMake's own Release default of -O3, and at
 # -O2 GCC 13 uses -fvect-cost-model=very-cheap, which declines loops whose trip count is only
 # known at runtime -- e.g. the RMSNorm scale loop in bitlinear.cpp. -O3 switches to `dynamic`.
-# -mcpu is deliberately NOT set here: it is target-specific (the A53 is in-order dual-issue, so
-# pipeline-tuned scheduling matters), so the FPGA runner's Makefile adds -mcpu=cortex-a53 on
-# aarch64 and this file stays portable.
+# -mcpu/-mtune are deliberately NOT set here: they are target-specific (the A53 is in-order
+# dual-issue, so pipeline-tuned scheduling matters), so the FPGA runner's Makefile adds
+# -mcpu=cortex-a53 on aarch64, MMFREE_TUNE_NATIVE below covers "build for this machine", and
+# this file stays portable.
 set(MMFREE_OPT_FLAGS "-O3" CACHE STRING "optimization flags for Release builds (no -ffast-math)")
-set(CMAKE_CXX_FLAGS_RELEASE "${MMFREE_OPT_FLAGS}")
-add_compile_options(-Wall -Wextra)
+if(MMFREE_GNU_FLAGS)
+  set(CMAKE_CXX_FLAGS_RELEASE "${MMFREE_OPT_FLAGS}")
+  add_compile_options(-Wall -Wextra)
+else()
+  add_compile_options(/W3)
+endif()
+
+# Schedule for the host CPU (-mtune/-mcpu, NOT -march): pure scheduling, it emits no new
+# instructions, so the binary stays runnable on other CPUs of the same arch and the numerics
+# are untouched. OFF by default to keep builds reproducible across machines.
+option(MMFREE_TUNE_NATIVE "tune scheduling for the build host (-mtune=native / -mcpu=native)" OFF)
 
 add_library(mmfreecpu STATIC
   src/kernels/rmsnorm.cpp
@@ -40,56 +67,123 @@ add_library(mmfreecpu STATIC
   src/util/profile.cpp
   src/util/bench.cpp
 )
-target_include_directories(mmfreecpu PUBLIC include)
+target_include_directories(mmfreecpu PUBLIC
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+  $<INSTALL_INTERFACE:include>)
 
 # SIMD backend: architecture-specific intrinsics selected at configure time and passed
 # down as a compile define (see include/mmfree/simd.hpp). Override with -DMMFREE_SIMD=...
-#   AUTO (default) -> detect from CMAKE_SYSTEM_PROCESSOR
+#   AUTO (default) -> detect from CMAKE_SYSTEM_PROCESSOR, and on x86 probe the host for
+#                     AVX-512 (see below) so a machine that has it gets it by default
 #   X86            -> AVX2 + FMA      (MMFREE_ARCH_X86)
 #   X86_512        -> AVX-512F/BW/DQ/VL + FMA (MMFREE_ARCH_X86; tq1.hpp then compiles its
 #                     512-bit ternary-dot paths, see MMFREE_AVX512 there). Host-specific:
 #                     only select it on a machine that has AVX-512.
 #   ARM            -> NEON            (MMFREE_ARCH_ARM)
 #   SCALAR         -> portable fallback (no define)
+#
+# AUTO is deliberately HOST-SPECIFIC, not lowest-common-denominator: even plain X86 emits
+# AVX2, which a pre-2013 CPU cannot run. For a binary that must run on an unknown machine,
+# pass -DMMFREE_SIMD=SCALAR (or X86 for the AVX2 baseline) explicitly.
 set(MMFREE_SIMD "AUTO" CACHE STRING "SIMD backend: AUTO|X86|X86_512|ARM|SCALAR")
+set_property(CACHE MMFREE_SIMD PROPERTY STRINGS AUTO X86 X86_512 ARM SCALAR)
+
 if(MMFREE_SIMD STREQUAL "AUTO")
   if(CMAKE_SYSTEM_PROCESSOR MATCHES "(x86_64|AMD64|i[3-6]86)")
     set(MMFREE_SIMD "X86")
-  elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "(aarch64|arm64|armv8)")
+    # Prefer the 512-bit ternary-dot paths when the host can actually run them. This used
+    # to need a manual -DMMFREE_SIMD=X86_512 and was worth ~29% on a Xeon, so "forgot the
+    # flag" was a silent 1/3 of throughput. Compile AND run the probe: compiling only
+    # proves the toolchain knows the intrinsics, not that this CPU executes them.
+    # Skipped when cross-compiling (can't run host code for the target) -- pass X86_512
+    # explicitly for a cross build.
+    if(NOT CMAKE_CROSSCOMPILING AND MMFREE_GNU_FLAGS)
+      include(CheckCXXSourceRuns)
+      set(CMAKE_REQUIRED_FLAGS "-mavx512f -mavx512bw -mavx512dq -mavx512vl -mfma")
+      # The probe exercises F + BW + VL because that is exactly the trio tq1.hpp gates
+      # MMFREE_AVX512 on; a CPU with F but not BW must fall back to AVX2.
+      check_cxx_source_runs("
+        #include <immintrin.h>
+        int main() {
+          __m512i a = _mm512_set1_epi16(3), b = _mm512_set1_epi16(5);
+          __m512i c = _mm512_maddubs_epi16(a, b);                      // AVX512BW
+          __m256i d = _mm256_maskz_add_epi32(0x0f, _mm512_castsi512_si256(c),
+                                             _mm256_set1_epi32(1));    // AVX512VL
+          return _mm512_reduce_add_epi32(_mm512_and_si512(               // AVX512F
+                     _mm512_castsi256_si512(d), _mm512_set1_epi32(0)));
+        }" MMFREE_HAVE_AVX512)
+      unset(CMAKE_REQUIRED_FLAGS)
+      if(MMFREE_HAVE_AVX512)
+        set(MMFREE_SIMD "X86_512")
+      endif()
+    endif()
+  elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "(aarch64|arm64|armv8|armv7)")
     set(MMFREE_SIMD "ARM")
   else()
     set(MMFREE_SIMD "SCALAR")
   endif()
+  message(STATUS "mmfree SIMD backend: ${MMFREE_SIMD} (auto-detected; override with -DMMFREE_SIMD=)")
+else()
+  message(STATUS "mmfree SIMD backend: ${MMFREE_SIMD} (requested)")
 endif()
-message(STATUS "mmfree SIMD backend: ${MMFREE_SIMD} (CMAKE_SYSTEM_PROCESSOR=${CMAKE_SYSTEM_PROCESSOR})")
 
 if(MMFREE_SIMD STREQUAL "X86")
   target_compile_definitions(mmfreecpu PUBLIC MMFREE_ARCH_X86)
-  target_compile_options(mmfreecpu PRIVATE -mavx2 -mfma)
+  target_compile_options(mmfreecpu PUBLIC -mavx2 -mfma)
 elseif(MMFREE_SIMD STREQUAL "X86_512")
   target_compile_definitions(mmfreecpu PUBLIC MMFREE_ARCH_X86)
   # PUBLIC, not PRIVATE: tq1.hpp is header-only and gates its 512-bit paths on __AVX512F__ /
   # __AVX512BW__, so a consumer compiled without these flags would silently get the AVX2 path
   # while this library got the 512-bit one -- the same incoherent-mix footgun the ARCH/SIMD
-  # split above already warns about.
+  # split above already warns about. (simd.hpp is header-only too, hence PUBLIC on X86.)
   target_compile_options(mmfreecpu PUBLIC -mavx512f -mavx512bw -mavx512dq -mavx512vl -mfma)
 elseif(MMFREE_SIMD STREQUAL "ARM")
   target_compile_definitions(mmfreecpu PUBLIC MMFREE_ARCH_ARM)
   # AArch64 has NEON in the baseline ISA (no flag needed). 32-bit ARM needs -mfpu=neon.
   if(NOT CMAKE_SYSTEM_PROCESSOR MATCHES "(aarch64|arm64)")
-    target_compile_options(mmfreecpu PRIVATE -mfpu=neon)
+    target_compile_options(mmfreecpu PUBLIC -mfpu=neon)
+  endif()
+endif()
+
+if(MMFREE_TUNE_NATIVE AND MMFREE_GNU_FLAGS)
+  if(CMAKE_SYSTEM_PROCESSOR MATCHES "(aarch64|arm64|armv8|armv7)")
+    set(MMFREE_TUNE_FLAG -mcpu=native)
+  else()
+    set(MMFREE_TUNE_FLAG -mtune=native)
+  endif()
+  include(CheckCXXCompilerFlag)
+  check_cxx_compiler_flag(${MMFREE_TUNE_FLAG} MMFREE_HAVE_TUNE_NATIVE)
+  if(MMFREE_HAVE_TUNE_NATIVE)
+    target_compile_options(mmfreecpu PRIVATE ${MMFREE_TUNE_FLAG})
+    message(STATUS "mmfree host tuning: ${MMFREE_TUNE_FLAG}")
+  else()
+    message(WARNING "MMFREE_TUNE_NATIVE=ON but the compiler rejects ${MMFREE_TUNE_FLAG} — ignoring.")
   endif()
 endif()
 
 # Threading: parallelize the ternary matmul over output rows (see bitlinear.cpp).
-# Optional -- without OpenMP the pragmas are ignored and the build stays single-threaded.
+# Optional -- without OpenMP the pragmas are ignored and the build stays single-threaded
+# (and still correct, just slower; see include/mmfree/parallel.hpp).
 find_package(OpenMP)
 if(OpenMP_CXX_FOUND)
   target_link_libraries(mmfreecpu PUBLIC OpenMP::OpenMP_CXX)
+  message(STATUS "mmfree threading: OpenMP ${OpenMP_CXX_VERSION}")
+else()
+  # Worth a loud line: the usual cause is AppleClang, which ships no OpenMP runtime, and
+  # the only symptom otherwise is single-core throughput.
+  message(WARNING "OpenMP not found — building SINGLE-THREADED (correct, but much slower).\n"
+                  "  macOS:  brew install libomp   (then re-run cmake)\n"
+                  "  Debian: sudo apt install libomp-dev  (clang)  /  g++ has it built in")
 endif()
 
 add_executable(mmfree-cli app/main.cpp)
 target_link_libraries(mmfree-cli PRIVATE mmfreecpu)
+
+include(GNUInstallDirs)
+install(TARGETS mmfree-cli mmfreecpu
+        RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+        ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR})
+install(DIRECTORY include/mmfree DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
 
 # Validation tests live on the `validation` branch (with the golden-oracle tooling
 # in tools/). They build only when tests/ is present, so this same CMakeLists works

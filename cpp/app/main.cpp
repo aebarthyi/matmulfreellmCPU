@@ -11,34 +11,7 @@
 // In --ids mode there is no tokenizer dependency and no EOS stop (exactly --gen tokens),
 // so the greedy stream stays directly comparable to the reference.
 //
-// Flags:
-//   --blob PATH        weight blob            (default model.mmfree)
-//   --tokenizer PATH   tokenizer blob         (default <blob dir>/tokenizer.mmtok)
-//   --mode float|fixed activation numerics    (default fixed = Q5.10 FPGA datapath)
-//   --frac N           fixed-point frac bits  (default 10)
-//   --gen N            max new tokens         (default 32)
-//   --temp T           sampling temperature   (default 0 = greedy/deterministic)
-//   --top-k K          sample from K highest logits (0 = full vocab; needs --temp > 0)
-//   --seed N           RNG seed for sampling  (default: random each run)
-//   --ids a,b,c        raw token ids (bypass tokenizer; ids-in/ids-out, no EOS stop)
-//   --decode-ids a,b,c decode ids to text and exit (no model run; for validation)
-//   --no-bos           do not prepend BOS in text mode
-//   --no-eos           do not stop at EOS in text mode
-//   --print-ids        print the full id stream on stdout instead of decoded text
-//   --show-ids         also print prompt/gen ids to stderr
-//   --logits-out PATH  write last-position logits of the full stream as raw float32
-//
-// Benchmark mode (tok/s):
-//   --bench            time generation instead of printing text; reports prefill and
-//                      decode throughput. Uses greedy decode with EOS disabled so every
-//                      run produces exactly --gen tokens (stable, comparable timing).
-//   --warmup N         untimed warmup runs before measuring (default 1)
-//   --reps N           timed runs to average over            (default 3)
-//   --profile          print a per-op wall-clock breakdown (matmul vs rmsnorm/scan/...),
-//                      so you can see what % of time the ternary matmul takes. Works on
-//                      its own (normal generation) or together with --bench.
-// e.g.  mmfree-cli --bench --gen 128            # default prompt, 128 new tokens
-//       mmfree-cli --bench --gen 256 --reps 5 "Once upon a time,"
+// The flag reference is kUsage below (printed by `--help`), so there is one copy of it.
 #include "mmfree/bench.hpp"
 #include "mmfree/model.hpp"
 #include "mmfree/profile.hpp"
@@ -49,6 +22,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <exception>
 #include <fstream>
 #include <functional>
 #include <iostream>
@@ -58,6 +32,91 @@
 #include <vector>
 
 using namespace mmfree;
+
+static const char kUsage[] =
+    R"(mmfree-cli — MatMul-Free LM (HGRN-Bit) inference, text in / text out.
+
+usage: mmfree-cli [flags] ["prompt text"]
+       echo "prompt" | mmfree-cli [flags]
+
+  mmfree-cli "The capital of France is" --gen 32
+  mmfree-cli --bench --gen 128 --reps 5          # timing run, fixed prompt
+  mmfree-cli --ids 1,415,310 --gen 8             # raw ids in/out (no tokenizer, no EOS)
+
+model files
+  --blob PATH        weight blob (default: $MMFREE_BLOB, else model.mmfree looked up in
+                     the working dir, then next to the executable and its parent dirs)
+  --tokenizer PATH   tokenizer blob (default: $MMFREE_TOKENIZER, else tokenizer.mmtok
+                     beside the weight blob)
+  Both are produced by tools/provision.py — see the README.
+
+generation
+  --gen N            max new tokens                        (default 32)
+  --temp T           sampling temperature, 0 = greedy       (default 0)
+  --top-k K          sample from the K highest logits, 0 = full vocab (needs --temp > 0)
+  --seed N           RNG seed for sampling                  (default: random each run)
+  --no-bos           do not prepend BOS in text mode
+  --no-eos           do not stop at EOS in text mode
+
+numerics
+  --mode float|fixed activation numerics (default fixed = the Q5.10 FPGA datapath)
+  --frac N           fixed-point fraction bits              (default 10)
+
+output / validation
+  --print-ids        print the full id stream instead of decoded text
+  --show-ids         also print prompt/gen ids to stderr
+  --decode-ids a,b,c decode ids to text and exit (no model run)
+  --logits-out PATH  write last-position logits of the full stream as raw float32
+
+benchmarking
+  --bench            time generation instead of printing text; reports prefill and decode
+                     throughput. Greedy with EOS disabled, so every run produces exactly
+                     --gen tokens (stable, comparable timing).
+  --warmup N         untimed warmup runs before measuring   (default 1)
+  --reps N           timed runs to average over             (default 3)
+  --profile          per-op wall-clock breakdown (matmul vs rmsnorm/scan/...). Works alone
+                     or with --bench.
+
+  -h, --help         this message
+)";
+
+static bool file_exists(const std::string& p) {
+  std::ifstream f(p, std::ios::binary);
+  return f.good();
+}
+
+// Directory holding the running executable, derived from argv[0] ("" if argv[0] carries no
+// path — e.g. an installed binary found through PATH; the working-dir candidates and
+// --blob/$MMFREE_BLOB still cover that case).
+static std::string exe_dir(const char* argv0) {
+  std::string p = argv0 ? argv0 : "";
+  std::size_t slash = p.find_last_of('/');
+  return (slash == std::string::npos) ? "" : p.substr(0, slash);
+}
+
+// Find `name` in the usual places so the engine runs from wherever it was built or
+// installed, not only from the directory holding the blob. In build-tree layouts the
+// binary sits in cpp/build/ (or cpp/build/Release/) while the blob sits in cpp/, hence
+// walking a couple of parents. Returns "" if nothing matched.
+static std::string search_model_file(const std::string& name, const char* argv0) {
+  std::vector<std::string> dirs = {"."};
+  std::string ed = exe_dir(argv0);
+  if (!ed.empty()) {
+    dirs.push_back(ed);
+    dirs.push_back(ed + "/..");
+    dirs.push_back(ed + "/../..");
+  }
+  for (const std::string& d : dirs) {
+    std::string cand = d + "/" + name;
+    if (file_exists(cand)) return cand;
+  }
+  return "";
+}
+
+static const char* env_or_null(const char* k) {
+  const char* v = std::getenv(k);
+  return (v && *v) ? v : nullptr;
+}
 
 static std::vector<std::int64_t> parse_ids(const std::string& s) {
   std::vector<std::int64_t> ids;
@@ -81,8 +140,8 @@ static std::string default_tokenizer_path(const std::string& blob) {
   return dir + "tokenizer.mmtok";
 }
 
-int main(int argc, char** argv) {
-  std::string blob = "model.mmfree", tokenizer_path, mode = "fixed", ids_arg, logits_out;
+static int run(int argc, char** argv) {
+  std::string blob, tokenizer_path, mode = "fixed", ids_arg, logits_out;
   std::string prompt, decode_arg;
   bool have_prompt = false, no_bos = false, no_eos = false, print_ids = false,
        show_ids = false, bench = false, profile = false;
@@ -114,15 +173,55 @@ int main(int argc, char** argv) {
     else if (k == "--warmup") bench_warmup = std::atoi(next());
     else if (k == "--reps") bench_reps = std::atoi(next());
     else if (k == "--profile") profile = true;
+    else if (k == "--help" || k == "-h") { std::fputs(kUsage, stdout); return 0; }
     else if (!k.empty() && k[0] == '-') {
-      std::fprintf(stderr, "unknown arg: %s\n", k.c_str());
+      std::fprintf(stderr, "unknown arg: %s\n(try --help)\n", k.c_str());
       return 2;
     } else {
       prompt = k;  // first positional = prompt text
       have_prompt = true;
     }
   }
-  if (tokenizer_path.empty()) tokenizer_path = default_tokenizer_path(blob);
+
+  // Resolve the model files: explicit flag > environment > search. Report a miss here
+  // rather than letting Weights/Tokenizer throw "cannot open model.mmfree", because at
+  // this point we still know WHERE we looked and what would fix it.
+  //
+  // The weight blob is only *required* by the paths that actually run the model -- the
+  // tokenizer-only paths (--decode-ids, `--gen 0 --print-ids`) must keep working on a
+  // machine that has never provisioned one.
+  const bool need_blob = decode_arg.empty() && (gen > 0 || !logits_out.empty() || bench);
+  if (blob.empty()) {
+    if (const char* e = env_or_null("MMFREE_BLOB")) {
+      blob = e;
+    } else {
+      blob = search_model_file("model.mmfree", argv[0]);
+      if (blob.empty() && need_blob) {
+        std::fprintf(stderr,
+                     "error: no weight blob found (looked for model.mmfree in the working "
+                     "directory and next to the executable).\n"
+                     "  provision one:  python tools/provision.py\n"
+                     "  or point at it: mmfree-cli --blob /path/to/model.mmfree  "
+                     "(or set MMFREE_BLOB)\n");
+        return 2;
+      }
+    }
+  }
+  if (tokenizer_path.empty()) {
+    if (const char* e = env_or_null("MMFREE_TOKENIZER")) {
+      tokenizer_path = e;
+    } else {
+      // Beside the blob first; then the same search the blob used, so a build-tree
+      // tokenizer.mmtok is found even when --blob points into a model zoo (or when there
+      // is no blob at all). Falling back to the bare name lets Tokenizer report the miss.
+      if (!blob.empty()) tokenizer_path = default_tokenizer_path(blob);
+      if (tokenizer_path.empty() || !file_exists(tokenizer_path)) {
+        std::string found = search_model_file("tokenizer.mmtok", argv[0]);
+        if (!found.empty()) tokenizer_path = found;
+        else if (tokenizer_path.empty()) tokenizer_path = "tokenizer.mmtok";
+      }
+    }
+  }
 
   // --decode-ids: pure tokenizer decode, no weights/model needed.
   if (!decode_arg.empty()) {
@@ -245,4 +344,20 @@ int main(int argc, char** argv) {
   // (text mode with gen > 0 was already streamed above)
   if (profile && gen > 0) print_profile(1);
   return 0;
+}
+
+int main(int argc, char** argv) {
+  // Weights/Tokenizer report bad or missing blobs by throwing; catching here turns what
+  // was an uncaught-exception abort into one actionable line.
+  try {
+    return run(argc, argv);
+  } catch (const std::exception& e) {
+    std::string msg = e.what();
+    std::fprintf(stderr, "error: %s\n", msg.c_str());
+    if (msg.compare(0, 9, "weights: ") == 0 || msg.compare(0, 11, "tokenizer: ") == 0)
+      std::fprintf(stderr,
+                   "hint: the model files come from `python tools/provision.py` "
+                   "(see the README); pass --blob/--tokenizer to point elsewhere.\n");
+    return 1;
+  }
 }
