@@ -653,6 +653,15 @@ struct Tq2Format {
 
 template <class Fmt>
 struct PackedBackend final : TernaryBackend {
+  PackedBackend() = default;
+  explicit PackedBackend(std::size_t batch) : batch_(batch ? batch : 1) {}
+
+  // See CpuBackend in ternary_backend.hpp for what batching does and why it is bit-exact.
+  // It matters MORE here than on the int8 path: a packed row is 1.625/2 bits per weight, so
+  // it is likelier to stay resident across the b rows, and these formats exist precisely to
+  // cut weight traffic — batching cuts it again along the other axis.
+  std::size_t batch_size() const override { return batch_; }
+
   void matmul(int /*proj_id*/, const std::int32_t* x, std::int32_t* acc,
               const std::int8_t* wq, std::size_t N, std::size_t M) override {
     if (!Fmt::fits(N)) {  // shape we can't block — stay on the int8 path
@@ -664,6 +673,30 @@ struct PackedBackend final : TernaryBackend {
     const std::size_t stride = Fmt::row_bytes(N);
 #pragma omp parallel for schedule(static)
     for (std::size_t o = 0; o < M; ++o) acc[o] = Fmt::dot_i32(x, packed + o * stride, N);
+  }
+
+  void matmul_batch(int proj_id, const std::int32_t* x, std::int32_t* acc,
+                    const std::int8_t* wq, std::size_t N, std::size_t M,
+                    std::size_t b) override {
+    if (b <= 1) { matmul(proj_id, x, acc, wq, N, M); return; }
+    if (!Fmt::fits(N)) {
+#pragma omp parallel for schedule(static)
+      for (std::size_t o = 0; o < M; ++o) {
+        const std::int8_t* w = wq + o * N;
+        for (std::size_t i = 0; i < b; ++i)
+          acc[i * M + o] = simd::ternary_dot_i32(x + i * N, w, N);
+      }
+      return;
+    }
+    // ensure() mutates the cache, so it must run BEFORE the parallel region (as in matmul).
+    const std::uint8_t* packed = ensure(wq, N, M);
+    const std::size_t stride = Fmt::row_bytes(N);
+#pragma omp parallel for schedule(static)
+    for (std::size_t o = 0; o < M; ++o) {
+      const std::uint8_t* q = packed + o * stride;
+      for (std::size_t i = 0; i < b; ++i)
+        acc[i * M + o] = Fmt::dot_i32(x + i * N, q, N);
+    }
   }
 
   std::size_t packed_bytes() const { return bytes_; }
@@ -688,6 +721,7 @@ struct PackedBackend final : TernaryBackend {
   // shared staging buffers in bitlinear.cpp already make.
   std::unordered_map<const std::int8_t*, std::vector<std::uint8_t>> cache_;
   std::size_t bytes_ = 0;
+  std::size_t batch_ = 1;
 };
 
 using Tq1Backend = PackedBackend<Tq1Format>;   // 1.625 bits/weight

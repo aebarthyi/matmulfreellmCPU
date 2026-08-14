@@ -43,6 +43,7 @@ usage: mmfree-cli [flags] ["prompt text"]
   mmfree-cli "The capital of France is" --gen 32
   mmfree-cli --bench --gen 128 --reps 5          # timing run, fixed prompt
   mmfree-cli --ids 1,415,310 --gen 8             # raw ids in/out (no tokenizer, no EOS)
+  mmfree-cli --bench --batch 8 --gen 128         # batched (8-stream) throughput
 
 model files
   --blob PATH        weight blob (default: $MMFREE_BLOB, else model.mmfree looked up in
@@ -58,6 +59,14 @@ generation
   --seed N           RNG seed for sampling                  (default: random each run)
   --no-bos           do not prepend BOS in text mode
   --no-eos           do not stop at EOS in text mode
+  --batch B          decode B concurrent streams in lockstep (default 1). Each stream gets
+                     its own recurrent state and is prefilled independently; the B decode
+                     steps then share ONE matmul per projection, so each weight row is
+                     fetched once and reused across the batch instead of the matrix being
+                     re-swept per stream. Lossless: batched results are bit-identical to
+                     B separate runs. With --bench this reports aggregate and per-stream
+                     throughput; otherwise every stream's text is printed, labelled.
+                     B > 1 also batches prefill, so prefill timings shift with it.
 
 numerics
   --mode float|fixed activation numerics (default fixed = the Q5.10 FPGA datapath)
@@ -160,6 +169,7 @@ static int run(int argc, char** argv) {
   int frac = 10;
   int bench_warmup = 1, bench_reps = 3;
   std::size_t gen = 32;
+  std::size_t batch = 1;
   Sampling samp;
   bool have_seed = false;
 
@@ -182,6 +192,7 @@ static int run(int argc, char** argv) {
     else if (k == "--print-ids") print_ids = true;
     else if (k == "--show-ids") show_ids = true;
     else if (k == "--logits-out") logits_out = next();
+    else if (k == "--batch") batch = static_cast<std::size_t>(std::atoll(next()));
     else if (k == "--bench") bench = true;
     else if (k == "--warmup") bench_warmup = std::atoi(next());
     else if (k == "--reps") bench_reps = std::atoi(next());
@@ -205,6 +216,10 @@ static int run(int argc, char** argv) {
   if (wfmt != "int8" && wfmt != "1.6bit" && wfmt != "2bit") {
     std::fprintf(stderr, "error: unknown --weights %s (expected int8, 1.6bit, or 2bit)\n",
                  wfmt.c_str());
+    return 2;
+  }
+  if (batch < 1) {
+    std::fprintf(stderr, "error: --batch must be >= 1 (got %zu)\n", batch);
     return 2;
   }
 
@@ -304,8 +319,21 @@ static int run(int argc, char** argv) {
   // the same model.mmfree serves all three formats.
   // set_backend's proj_ids map stays empty — it exists for backends with resident
   // per-projection weights (the FPGA); the CPU backends ignore proj_id.
+  // --batch rides along on the same seam: the batch width is a property of the backend
+  // (batch_size()), which is what bitlinear chunks its rows by. int8 normally runs with NO
+  // backend installed (bitlinear falls back to an internal CpuBackend), so a batched int8
+  // run has to install one explicitly — it is the very same class, just constructed with a
+  // width, so this does not change the arithmetic.
+  std::unique_ptr<CpuBackend> cpu;
   std::unique_ptr<Tq1Backend> tq1;
   std::unique_ptr<Tq2Backend> tq2;
+  if (model && batch > 1 && aq != ActQuant::FixedQ510) {
+    // Same honesty rule as --weights: the float path never consults the backend, so the
+    // streams would run but the batching would not be doing anything.
+    std::fprintf(stderr, "warning: --batch %zu does not batch the matmul in --mode float "
+                         "(the backend seam is integer-only); streams run independently\n",
+                 batch);
+  }
   if (model && wfmt != "int8") {
     if (aq != ActQuant::FixedQ510) {
       // bitlinear only consults the backend on the integer path, so honouring --weights
@@ -314,18 +342,21 @@ static int run(int argc, char** argv) {
                            "(the packed kernels are integer-only); using int8\n",
                    wfmt.c_str());
     } else if (wfmt == "1.6bit") {
-      tq1 = std::make_unique<Tq1Backend>();
+      tq1 = std::make_unique<Tq1Backend>(batch);
       model->set_backend(tq1.get(), {});
       std::fprintf(stderr, "weight format: %s, %.4f bits/weight (%zu-weight blocks, %zu B)\n",
                    Tq1Backend::format_name(), Tq1Backend::format_bits(),
                    tq1::kBlockElems, tq1::kBlockBytes);
     } else {  // 2bit
-      tq2 = std::make_unique<Tq2Backend>();
+      tq2 = std::make_unique<Tq2Backend>(batch);
       model->set_backend(tq2.get(), {});
       std::fprintf(stderr, "weight format: %s, %.4f bits/weight (%zu-weight blocks, %zu B)\n",
                    Tq2Backend::format_name(), Tq2Backend::format_bits(),
                    tq2::kBlockElems, tq2::kBlockBytes);
     }
+  } else if (model && batch > 1 && aq == ActQuant::FixedQ510) {
+    cpu = std::make_unique<CpuBackend>(batch);
+    model->set_backend(cpu.get(), {});
   }
 
   // ---- benchmark mode: time generation, report prefill/decode tok/s, then exit ----
@@ -336,12 +367,44 @@ static int run(int argc, char** argv) {
     opts.warmup = bench_warmup;
     opts.reps = bench_reps;
     opts.profile = profile;
+    opts.batch = batch;
     run_bench(*model, ids, opts, blob.c_str(), mode.c_str(), frac);
     return 0;
   }
 
   // Sampling: a random seed each run unless --seed pins it (greedy ignores the seed).
   if (samp.temperature > 0.0f && !have_seed) samp.seed = std::random_device{}();
+
+  // ---- --batch B (non-bench): decode B streams in lockstep and print each -------------
+  // Kept separate from the single-stream path below rather than folded into it: per-token
+  // text streaming re-decodes the whole stream to emit a byte suffix, which cannot be
+  // interleaved across B streams without garbling them. So batched runs print per stream
+  // once complete. Greedy + one prompt => every stream must come out identical, which is
+  // the cheap self-check on the batched kernel (a real permutation check needs distinct
+  // rows — cpp/tests/test_tq1.cpp does that).
+  if (batch > 1 && gen > 0) {
+    std::int64_t eos_b = (!ids_mode && !no_eos && tok) ? tok->eos_id() : -1;
+    std::vector<std::vector<std::int64_t>> prompts(batch, ids);
+    if (profile) { Profiler::instance().reset(); Profiler::instance().enable(true); }
+    std::vector<std::vector<std::int64_t>> streams =
+        model->generate_serve(prompts, gen, eos_b, samp);
+    if (profile) Profiler::instance().enable(false);
+
+    for (std::size_t s = 0; s < streams.size(); ++s) {
+      std::printf("[stream %zu] ", s);
+      if (ids_out) {
+        for (std::size_t i = 0; i < streams[s].size(); ++i)
+          std::printf("%s%lld", i ? " " : "", static_cast<long long>(streams[s][i]));
+        std::printf("\n");
+      } else {
+        std::vector<std::int64_t> gen_only(
+            streams[s].begin() + static_cast<std::ptrdiff_t>(ids.size()), streams[s].end());
+        std::printf("%s\n", tok->decode(gen_only).c_str());
+      }
+    }
+    if (profile) print_profile(1);
+    return 0;
+  }
 
   // Stream decoded text token-by-token (text-output mode only). BPE decode isn't safe
   // per-token (▁->space, leading-space strip, multi-byte/byte-fallback fusion), so we

@@ -19,9 +19,12 @@
 //      the packing is lossless and integer addition is associative, so a differing summation
 //      order cannot move the result. This is the property the CPU==FPGA gate depends on.
 //   4. dot_f32 matches the scalar fp reference to reduction-order noise.
+//   5. batched matmul (mmfree-cli --batch) == per-row matmul, over DISTINCT rows so a
+//      row/column permutation cannot pass unnoticed.
 #include "mmfree/simd.hpp"
 #include "mmfree/tq1.hpp"
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -253,6 +256,84 @@ void test_backend() {
               bad2 == 0 ? "exact" : "MISMATCH");
 }
 
+// ---- batched matmul == per-row matmul, for every backend --------------------------------
+// The batched kernels (CpuBackend/PackedBackend::matmul_batch, driven by `mmfree-cli
+// --batch B`) only reorder the loops: weight row outer, batch inner, so each row is fetched
+// once and reused across the b activations. Every acc[i*M+o] is still the same
+// ternary_dot_i32 call on the same operands, so the results must be EXACT, not close.
+//
+// The rows here are DELIBERATELY DISTINCT. A batched kernel that mixes rows up — writes
+// acc[i] from x[j], or transposes the acc layout — is invisible to a check that feeds b
+// copies of one row, because every answer is then correct by accident. Distinct rows make
+// any permutation a hard mismatch. (Same trap as the board-side streams check: a shared
+// prompt cannot see a row swap.)
+void test_batch() {
+  std::printf("[6] batched matmul == per-row matmul, distinct rows (N=1024, M=512, b=1..8)\n");
+  const std::size_t N = 1024, M = 512, BMAX = 8;
+  std::mt19937 rng(11);
+  std::uniform_int_distribution<int> trit(-1, 1);
+  std::uniform_int_distribution<int> act(-32768, 32767);
+  std::vector<std::int8_t> wq(N * M);
+  std::vector<std::int32_t> x(BMAX * N);
+  for (auto& v : wq) v = (std::int8_t)trit(rng);
+  for (auto& v : x) v = act(rng);
+
+  // Per-row reference: b independent matmul() calls, i.e. exactly what batch_size()==1 does.
+  std::vector<std::int32_t> ref(BMAX * M);
+  mmfree::CpuBackend ref_be;
+  for (std::size_t i = 0; i < BMAX; ++i)
+    ref_be.matmul(0, x.data() + i * N, ref.data() + i * M, wq.data(), N, M);
+
+  // Sanity on the reference itself: distinct activation rows must give distinct outputs,
+  // otherwise this test could not detect a permutation in the first place.
+  int identical_rows = 0;
+  for (std::size_t i = 1; i < BMAX; ++i)
+    identical_rows += (std::equal(ref.begin() + i * M, ref.begin() + (i + 1) * M, ref.begin()));
+  check(identical_rows == 0, "reference rows are distinct (test can see a permutation)");
+
+  for (std::size_t b = 1; b <= BMAX; ++b) {
+    std::vector<std::int32_t> got(b * M, 0);
+    int bad = 0;
+
+    mmfree::CpuBackend cpu(b);
+    check(cpu.batch_size() == b, "CpuBackend reports its batch width");
+    cpu.matmul_batch(0, x.data(), got.data(), wq.data(), N, M, b);
+    for (std::size_t i = 0; i < b * M; ++i) bad += (got[i] != ref[i]);
+    check(bad == 0, "CpuBackend::matmul_batch == per-row matmul (exact)");
+
+    std::fill(got.begin(), got.end(), 0);
+    mmfree::Tq1Backend tq(b);
+    tq.matmul_batch(0, x.data(), got.data(), wq.data(), N, M, b);
+    for (std::size_t i = 0; i < b * M; ++i) bad += (got[i] != ref[i]);
+    check(bad == 0, "Tq1Backend::matmul_batch == per-row matmul (exact)");
+
+    std::fill(got.begin(), got.end(), 0);
+    mmfree::Tq2Backend tq2b(b);
+    tq2b.matmul_batch(0, x.data(), got.data(), wq.data(), N, M, b);
+    for (std::size_t i = 0; i < b * M; ++i) bad += (got[i] != ref[i]);
+    check(bad == 0, "Tq2Backend::matmul_batch == per-row matmul (exact)");
+
+    if (bad) std::printf("      b=%zu: %d mismatching accumulators\n", b, bad);
+  }
+
+  // The non-blockable fallback inside PackedBackend::matmul_batch is a separate branch from
+  // the one matmul() takes, so it needs its own check.
+  const std::size_t Nodd = 1000, Modd = 8, b = 4;
+  std::vector<std::int8_t> wq2(Nodd * Modd);
+  std::vector<std::int32_t> x2(b * Nodd), r2(b * Modd), g2(b * Modd);
+  for (auto& v : wq2) v = (std::int8_t)trit(rng);
+  for (auto& v : x2) v = act(rng);
+  for (std::size_t i = 0; i < b; ++i)
+    ref_be.matmul(0, x2.data() + i * Nodd, r2.data() + i * Modd, wq2.data(), Nodd, Modd);
+  mmfree::Tq1Backend tq_odd(b);
+  tq_odd.matmul_batch(0, x2.data(), g2.data(), wq2.data(), Nodd, Modd, b);
+  int bad_odd = 0;
+  for (std::size_t i = 0; i < b * Modd; ++i) bad_odd += (g2[i] != r2[i]);
+  check(bad_odd == 0, "batched non-blockable N falls back to int8 exactly");
+  std::printf("      b=1..%zu exact for int8 / TQ1_0 / 2-bit; N=%zu fallback: %s\n", BMAX, Nodd,
+              bad_odd == 0 ? "exact" : "MISMATCH");
+}
+
 // ---- optional microbenchmark (--bench): int8 vs TQ1_0 on a full projection --------------
 // The whole point of TQ1_0 here is weight TRAFFIC, so the benchmark must use a weight matrix
 // far bigger than L2 (1 MiB on the K26) — a cache-resident matrix would measure only the
@@ -329,6 +410,8 @@ int main(int argc, char** argv) {
   test_random_many();
   std::printf("\n");
   test_backend();
+  std::printf("\n");
+  test_batch();
   std::printf("\n%s\n", g_fail == 0 ? "ALL TQ1_0 CHECKS PASSED" : "TQ1_0 CHECKS FAILED");
   if (do_bench) {
     std::printf("\n");

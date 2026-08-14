@@ -43,11 +43,14 @@ REPS       ?= 3
 # In-memory ternary weight format: int8 (default) | 1.6bit | 2bit. Lossless, so results are
 # bit-identical; the packed ones cut weight traffic per token ~5x/4x.
 WEIGHTS    ?=
+# Concurrent streams to decode in lockstep. 1 = single-stream (unchanged numbers); >1 also
+# batches prefill, so prefill timings shift with it. Lossless either way.
+BATCH      ?=
 ARGS       ?=
 
 CMAKE_ARGS := -DCMAKE_BUILD_TYPE=$(BUILD_TYPE) -DMMFREE_TUNE_NATIVE=$(TUNE) \
               $(if $(SIMD),-DMMFREE_SIMD=$(SIMD),)
-CLI_ARGS   := $(if $(WEIGHTS),--weights $(WEIGHTS),) $(ARGS)
+CLI_ARGS   := $(if $(WEIGHTS),--weights $(WEIGHTS),) $(if $(BATCH),--batch $(BATCH),) $(ARGS)
 
 .PHONY: all build configure model run bench profile test smoke install clean distclean help
 
@@ -137,6 +140,7 @@ help:
 	@echo '  PROMPT=$(PROMPT)'
 	@echo '  GEN=$(GEN)   REPS=$(REPS)   JOBS=$(JOBS)'
 	@echo '  WEIGHTS=$(if $(WEIGHTS),$(WEIGHTS),int8)          # int8|1.6bit|2bit (packed = same results, less traffic)'
+	@echo '  BATCH=$(if $(BATCH),$(BATCH),1)                   # concurrent streams decoded in lockstep (bit-identical)'
 	@echo '  BUILD=$(BUILD)   BUILD_TYPE=$(BUILD_TYPE)'
 	@echo '  SIMD=$(if $(SIMD),$(SIMD),<auto-detect>)   # SCALAR|X86|X86_512|ARM'
 	@echo '  TUNE=$(TUNE)                # ON = -mtune/-mcpu=native (host-tuned scheduling)'
@@ -148,5 +152,6 @@ help:
 	@echo '  make -j && make model && make run PROMPT="Once upon a time,"'
 	@echo '  make bench GEN=128 REPS=5'
 	@echo '  make bench WEIGHTS=2bit           # compare against WEIGHTS=int8'
+	@echo '  make bench BATCH=8                # batched throughput (aggregate + per-stream)'
 	@echo '  make build SIMD=SCALAR BUILD=/tmp/b   # portable binary, out-of-tree'
 	@echo '  make model MODEL=ridger/MMfreeLM-1.3B'

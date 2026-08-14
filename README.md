@@ -128,6 +128,7 @@ mmfree-cli "The capital of France is" --gen 32   # prompt -> streamed text
 echo "Once upon a time," | mmfree-cli            # prompt on stdin
 mmfree-cli --ids 1,415,310 --gen 8               # raw ids in/out (no tokenizer, no EOS)
 mmfree-cli --bench --gen 128 --reps 5            # prefill + decode tok/s
+mmfree-cli --bench --batch 8 --gen 128           # 8-stream batched throughput
 mmfree-cli --bench --profile --gen 128           # per-op breakdown (matmul vs the rest)
 mmfree-cli --help                                # every flag
 ```
@@ -173,6 +174,40 @@ the executable, its parent directories and a `cpp/` sibling, so `./build/mmfree-
 the repo root finds the `make model` blob in `cpp/` without a flag. `$MMFREE_BLOB` / `$MMFREE_TOKENIZER`
 override the search; `--blob` / `--tokenizer` override everything. The tokenizer is looked up
 next to the blob.
+
+### Batching (`--batch B`)
+
+`--batch B` decodes **B concurrent streams in lockstep**. Each stream carries its own
+recurrent state and is prefilled independently; the B decode steps then share **one** matmul
+per projection. The kernels walk that matmul weight-row-outer / batch-inner, so each weight
+row is fetched once and reused across all B activations instead of the whole `[M, N]` matrix
+being re-swept per stream — weight traffic per token drops roughly B-fold. It is the same
+lever batching pulls on the FPGA (there the resident weights stream once per batched matmul;
+here they land once in cache), which is what makes the two directly comparable.
+
+```sh
+mmfree-cli --bench --batch 8 --gen 128            # aggregate + per-stream tok/s
+mmfree-cli --bench --batch 8 --weights 2bit       # batching composes with the packed formats
+mmfree-cli --batch 4 "Once upon a time,"          # prints each stream, labelled
+make bench BATCH=8 WEIGHTS=2bit                   # same thing through the Makefile
+```
+
+Batching is **opt-in and lossless**. Without `--batch` the backend width stays 1 and every
+number reproduces exactly as before. With it, each `acc[i][o]` is still the identical
+`ternary_dot_i32` call on the identical operands — only the loop order changes — so batched
+output is *bit-identical* to B separate runs, not merely close. `cpp/tests/test_tq1.cpp`
+check 5 asserts that for b=1..8 across all three weight formats, using **distinct** activation
+rows so a row/column permutation cannot pass unnoticed.
+
+Two things to know when reading the numbers:
+
+- `--bench` reports **aggregate** decode tok/s (all streams) with per-stream alongside.
+  Aggregate is the serving metric; per-stream is what one user sees.
+- `--batch B` batches **prefill** too, so prefill timings shift with B. Compare like with
+  like — a `--batch 8` prefill number is not comparable to a `--batch 1` one.
+
+`--mode float` ignores batching for the matmul (the backend seam is integer-only) and says
+so; the streams still run, just without the weight reuse.
 
 Threading follows OpenMP: `OMP_NUM_THREADS=4 mmfree-cli ...`. Only independent rows and
 disjoint elementwise ranges are parallelized, never a floating-point reduction, so thread

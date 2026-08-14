@@ -93,13 +93,49 @@ struct TernaryBackend {
 // CPU reference: the original per-output int32 ternary reduction. Parallelized over output
 // rows exactly as the inline loop in bitlinear.cpp was, so results are bit-identical and
 // independent of lane/row order (integer accumulation is associative).
+//
+// BATCHING. `batch` > 1 makes bitlinear hand this backend b activation rows per call, which
+// it walks WEIGHT-ROW-OUTER / batch-inner: each weight row wq[o] is fetched once and reused
+// for all b activations while it is still hot in L1/L2, instead of the whole [M,N] matrix
+// being re-swept once per row. Weight traffic per token therefore falls ~b-fold, which is
+// the same reason batching pays on the FPGA — there the resident weights stream once per
+// matmul_batch, here they land once in cache.
+//
+// Every acc[i*M + o] is still exactly `ternary_dot_i32(x + i*N, wq + o*N, N)` — the same
+// call with the same operands as the per-row path, only issued in a different order. The
+// results are therefore BIT-IDENTICAL to batch=1, not merely close, so a batched run stays
+// a valid reference for the CPU==FPGA gate. cpp/tests/test_tq1.cpp checks this with
+// DISTINCT activation rows, which is what catches a row/column mix-up (identical rows
+// cannot see a permutation).
+//
+// Default 1 = the historical behaviour, so no existing measurement moves unless asked.
 struct CpuBackend final : TernaryBackend {
+  CpuBackend() = default;
+  explicit CpuBackend(std::size_t batch) : batch_(batch ? batch : 1) {}
+
+  std::size_t batch_size() const override { return batch_; }
+
   void matmul(int /*proj_id*/, const std::int32_t* x, std::int32_t* acc,
               const std::int8_t* wq, std::size_t N, std::size_t M) override {
 #pragma omp parallel for schedule(static)
     for (std::size_t o = 0; o < M; ++o)
       acc[o] = simd::ternary_dot_i32(x, wq + o * N, N);
   }
+
+  void matmul_batch(int proj_id, const std::int32_t* x, std::int32_t* acc,
+                    const std::int8_t* wq, std::size_t N, std::size_t M,
+                    std::size_t b) override {
+    if (b <= 1) { matmul(proj_id, x, acc, wq, N, M); return; }
+#pragma omp parallel for schedule(static)
+    for (std::size_t o = 0; o < M; ++o) {
+      const std::int8_t* w = wq + o * N;  // hoisted: reused by every row below
+      for (std::size_t i = 0; i < b; ++i)
+        acc[i * M + o] = simd::ternary_dot_i32(x + i * N, w, N);
+    }
+  }
+
+ private:
+  std::size_t batch_ = 1;
 };
 
 }  // namespace mmfree

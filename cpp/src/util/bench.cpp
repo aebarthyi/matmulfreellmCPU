@@ -44,24 +44,37 @@ BenchResult run_bench(Model& model, const std::vector<std::int64_t>& ids, const 
   using clk = std::chrono::steady_clock;
   auto secs = [](clk::duration d) { return std::chrono::duration<double>(d).count(); };
 
-  // One timed generation. Greedy, EOS disabled -> always exactly opts.gen tokens.
-  // The on_token callback timestamps the first emitted token (end of prefill) and the
-  // last, splitting prompt processing (prefill) from per-token decode.
+  const std::size_t B = opts.batch > 0 ? opts.batch : 1;
+
+  // One timed generation. Greedy, EOS disabled -> always exactly opts.gen tokens PER STREAM.
+  // The on_token callback timestamps the end of prefill and the last token, splitting prompt
+  // processing from per-token decode. `gen_n` counts tokens across ALL streams.
+  //
+  // Prefill emits exactly one token per stream (generate_serve prefills stream-by-stream, so
+  // those B callbacks arrive staggered and the B-th marks the start of batched decode) — so
+  // the "first token" boundary generalizes from callback 1 to callback B, and at B == 1 it
+  // is the original condition unchanged.
   struct RunStat { double prefill_s, decode_s, total_s; std::size_t gen_n; };
   auto run_once = [&]() -> RunStat {
     Sampling g;  // temperature 0 => greedy
     clk::time_point t0 = clk::now(), t_first = t0, t_last = t0;
-    bool got_first = false;
     std::size_t n = 0;
-    auto cb = [&](std::int64_t) {
+    auto tick = [&]() {
       clk::time_point now = clk::now();
-      if (!got_first) { t_first = now; got_first = true; }
+      if (++n == B) t_first = now;  // prefill done for every stream
       t_last = now;
-      ++n;
     };
-    model.generate(ids, opts.gen, /*eos=*/-1, g, cb);
+    if (B == 1) {
+      // Unchanged single-stream path: same call, same callback shape as before batching
+      // existed, so every historical number reproduces exactly.
+      model.generate(ids, opts.gen, /*eos=*/-1, g, [&](std::int64_t) { tick(); });
+    } else {
+      std::vector<std::vector<std::int64_t>> prompts(B, ids);
+      model.generate_serve(prompts, opts.gen, /*eos=*/-1, g,
+                           [&](std::size_t, std::int64_t) { tick(); });
+    }
     double prefill_s = secs(t_first - t0);
-    double decode_s = (n > 1) ? secs(t_last - t_first) : 0.0;
+    double decode_s = (n > B) ? secs(t_last - t_first) : 0.0;
     return {prefill_s, decode_s, secs(t_last - t0), n};
   };
 
@@ -74,7 +87,8 @@ BenchResult run_bench(Model& model, const std::vector<std::int64_t>& ids, const 
   std::printf("  mode:          %s (frac=%d)\n", mode_label, frac);
   std::printf("  threads:       %d\n", threads);
   std::printf("  prompt tokens: %zu\n", ids.size());
-  std::printf("  gen tokens:    %zu\n", opts.gen);
+  std::printf("  gen tokens:    %zu%s\n", opts.gen, B > 1 ? " (per stream)" : "");
+  if (B > 1) std::printf("  batch:         %zu streams decoded in lockstep\n", B);
   std::printf("  warmup/reps:   %d/%d\n\n", opts.warmup, opts.reps);
 
   for (int i = 0; i < opts.warmup; ++i) run_once();
@@ -83,13 +97,23 @@ BenchResult run_bench(Model& model, const std::vector<std::int64_t>& ids, const 
   // reported tok/s. Totals are divided by reps in print_profile -> "per generation".
   if (opts.profile) { Profiler::instance().reset(); Profiler::instance().enable(true); }
 
+  // Throughput is AGGREGATE across streams: (tokens emitted after prefill) / decode time.
+  // At B == 1 that is the historical (gen_n - 1) / decode_s. Per-stream is the same number
+  // divided by B and is printed alongside, because the two answer different questions — a
+  // serving system cares about aggregate, a single user cares about per-stream.
   double sum_prefill = 0, sum_decode = 0, sum_total = 0, sum_dec_tps = 0;
   for (int i = 0; i < opts.reps; ++i) {
     RunStat s = run_once();
-    double dec_tps = (s.gen_n > 1 && s.decode_s > 0) ? (s.gen_n - 1) / s.decode_s : 0.0;
+    double dec_tps = (s.gen_n > B && s.decode_s > 0) ? (s.gen_n - B) / s.decode_s : 0.0;
     double overall_tps = (s.total_s > 0) ? s.gen_n / s.total_s : 0.0;
-    std::printf("  run %d: prefill %7.1f ms   decode %8.2f tok/s   overall %8.2f tok/s\n",
-                i + 1, s.prefill_s * 1e3, dec_tps, overall_tps);
+    if (B > 1) {
+      std::printf("  run %d: prefill %7.1f ms   decode %8.2f tok/s (%6.2f/stream)"
+                  "   overall %8.2f tok/s\n",
+                  i + 1, s.prefill_s * 1e3, dec_tps, dec_tps / B, overall_tps);
+    } else {
+      std::printf("  run %d: prefill %7.1f ms   decode %8.2f tok/s   overall %8.2f tok/s\n",
+                  i + 1, s.prefill_s * 1e3, dec_tps, overall_tps);
+    }
     sum_prefill += s.prefill_s;
     sum_decode += s.decode_s;
     sum_total += s.total_s;
@@ -99,16 +123,23 @@ BenchResult run_bench(Model& model, const std::vector<std::int64_t>& ids, const 
   double avg_prefill = sum_prefill / n;
   double avg_dec_tps = sum_dec_tps / n;
   double avg_total = sum_total / n;
-  double prefill_tps = avg_prefill > 0 ? ids.size() / avg_prefill : 0.0;
-  double overall_tps = avg_total > 0 ? (opts.gen / avg_total) : 0.0;
+  const std::size_t prompt_toks = ids.size() * B;   // every stream is prefilled
+  const std::size_t gen_toks = opts.gen * B;
+  double prefill_tps = avg_prefill > 0 ? prompt_toks / avg_prefill : 0.0;
+  double overall_tps = avg_total > 0 ? (gen_toks / avg_total) : 0.0;
   std::printf("\n  avg prefill: %7.1f ms  (%.2f tok/s over %zu prompt tokens)\n",
-              avg_prefill * 1e3, prefill_tps, ids.size());
-  std::printf("  avg decode:  %8.2f tok/s\n", avg_dec_tps);
-  std::printf("  avg overall: %8.2f tok/s  (%zu gen tokens / %.3f s)\n", overall_tps, opts.gen,
+              avg_prefill * 1e3, prefill_tps, prompt_toks);
+  if (B > 1) {
+    std::printf("  avg decode:  %8.2f tok/s aggregate  (%.2f tok/s per stream x %zu)\n",
+                avg_dec_tps, avg_dec_tps / B, B);
+  } else {
+    std::printf("  avg decode:  %8.2f tok/s\n", avg_dec_tps);
+  }
+  std::printf("  avg overall: %8.2f tok/s  (%zu gen tokens / %.3f s)\n", overall_tps, gen_toks,
               avg_total);
   if (opts.profile) { Profiler::instance().enable(false); print_profile(opts.reps); }
   (void)sum_decode;
-  return {avg_prefill, avg_dec_tps, overall_tps, ids.size(), opts.gen};
+  return {avg_prefill, avg_dec_tps, overall_tps, prompt_toks, opts.gen, B};
 }
 
 }  // namespace mmfree
