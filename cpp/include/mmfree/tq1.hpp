@@ -425,9 +425,27 @@ inline Acc dot_scalar(const T* x, const std::uint8_t* src, std::size_t n) {
 }
 
 #if defined(MMFREE_ARCH_ARM)
-// The NEON shift amount must be a compile-time constant, so l is unrolled rather than looped.
-#define MMFREE_TQ2_TRITS(qv, SH) \
-  vsubq_s8(vreinterpretq_s8_u8(vandq_u8(vshrq_n_u8((qv), (SH)), vdupq_n_u8(0x3))), vdupq_n_s8(1))
+// The NEON shift amount must be a compile-time constant, so l is unrolled rather than looped
+// and SH arrives as a template argument.
+//
+// SH=0 (level 0, the low two bits) needs no shift at all, and it must not be written as one:
+// ACLE gives vshrq_n_u8 an immediate range of [1,8], so `vshrq_n_u8(v, 0)` is out of range.
+// GCC accepts it anyway and folds it to a no-op, which is why this compiled on Linux/aarch64;
+// Apple clang enforces the range and rejects it ("argument value 0 is outside of valid range
+// [1,8]"), so an M-series build died here. `if constexpr` keeps the bad call from even being
+// instantiated for SH=0 — a plain `if` would still have to compile it.
+template <int SH>
+inline int8x16_t tq2_trits(uint8x16_t qv) {
+  static_assert(SH >= 0 && SH <= 6 && SH % 2 == 0, "trit level shift is 0/2/4/6");
+  uint8x16_t s;
+  if constexpr (SH == 0) {
+    s = qv;
+  } else {
+    s = vshrq_n_u8(qv, SH);
+  }
+  return vsubq_s8(vreinterpretq_s8_u8(vandq_u8(s, vdupq_n_u8(0x3))), vdupq_n_s8(1));
+}
+#define MMFREE_TQ2_TRITS(qv, SH) ::mmfree::tq2::tq2_trits<(SH)>((qv))
 #endif
 
 #if defined(MMFREE_ARCH_X86)

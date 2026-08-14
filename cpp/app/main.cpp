@@ -104,15 +104,19 @@ static std::string exe_dir(const char* argv0) {
 
 // Find `name` in the usual places so the engine runs from wherever it was built or
 // installed, not only from the directory holding the blob. In build-tree layouts the
-// binary sits in cpp/build/ (or cpp/build/Release/) while the blob sits in cpp/, hence
-// walking a couple of parents. Returns "" if nothing matched.
+// binary sits in build/ (or build/Release/, or the older cpp/build/) while `make model`
+// writes the blob to cpp/, hence walking a couple of parents AND checking a cpp/ sibling:
+// from build/ the blob is at ../cpp/, from cpp/build/ it is at ../. Returns "" if nothing
+// matched. Order is cheapest-and-most-specific first; every candidate is one stat.
 static std::string search_model_file(const std::string& name, const char* argv0) {
-  std::vector<std::string> dirs = {"."};
+  std::vector<std::string> dirs = {".", "./cpp"};
   std::string ed = exe_dir(argv0);
   if (!ed.empty()) {
     dirs.push_back(ed);
     dirs.push_back(ed + "/..");
+    dirs.push_back(ed + "/../cpp");
     dirs.push_back(ed + "/../..");
+    dirs.push_back(ed + "/../../cpp");
   }
   for (const std::string& d : dirs) {
     std::string cand = d + "/" + name;

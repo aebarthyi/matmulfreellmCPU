@@ -20,7 +20,7 @@ no multiplies. Nothing here needs a GPU, and the engine itself needs no Python.
 ## Quickstart
 
 ```sh
-make                                    # configure + build -> cpp/build/mmfree-cli
+make                                    # configure + build -> build/mmfree-cli
 pip install -r tools/requirements.txt   # one-time, for provisioning only
 make model                              # download + pack MMfreeLM-370M (~0.7 GB download)
 make run PROMPT="In a shocking finding, scientists discovered"
@@ -30,10 +30,10 @@ make run PROMPT="In a shocking finding, scientists discovered"
 commands work just as well:
 
 ```sh
-cmake -S cpp -B cpp/build -DCMAKE_BUILD_TYPE=Release
-cmake --build cpp/build -j
+cmake -S cpp -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j
 python tools/provision.py                       # -> cpp/{model.mmfree,tokenizer.mmtok}
-./cpp/build/mmfree-cli "Once upon a time," --gen 32
+./build/mmfree-cli "Once upon a time," --gen 32
 ```
 
 ## Requirements
@@ -56,7 +56,7 @@ under WSL.
 
 ## Build options
 
-All are `cmake -S cpp -B cpp/build -D<OPT>=<VALUE>`, or `make build <OPT>=<VALUE>`:
+All are `cmake -S cpp -B build -D<OPT>=<VALUE>`, or `make build <OPT>=<VALUE>`:
 
 | option | default | what it does |
 |---|---|---|
@@ -169,8 +169,8 @@ Cortex-A53 the 1.6-bit path measured *slower* than `int8`). Benchmark both on th
 rather than assuming: `make bench WEIGHTS=2bit` against `make bench`.
 
 With no `--blob`, the engine looks for `model.mmfree` in the working directory, then beside
-the executable and its parent directories, so both `cd cpp && ./build/mmfree-cli` and
-`./cpp/build/mmfree-cli` from the repo root just work. `$MMFREE_BLOB` / `$MMFREE_TOKENIZER`
+the executable, its parent directories and a `cpp/` sibling, so `./build/mmfree-cli` from
+the repo root finds the `make model` blob in `cpp/` without a flag. `$MMFREE_BLOB` / `$MMFREE_TOKENIZER`
 override the search; `--blob` / `--tokenizer` override everything. The tokenizer is looked up
 next to the blob.
 
@@ -205,7 +205,7 @@ hardware backend be checked against the CPU bit-for-bit.
 
 ```sh
 make test          # here: cpp/tests/test_tq1 (packed-weight kernels) + smoke
-./cpp/build/test_tq1 --bench    # the same checks plus a kernel throughput report
+./build/test_tq1 --bench    # the same checks plus a kernel throughput report
 ```
 
 `test_tq1` needs no model blob and no hardware, and it exercises whichever SIMD path the

@@ -4,7 +4,7 @@
 # can also run by hand (each recipe echoes what it does). The engine itself needs only a
 # C++17 compiler and CMake — no Python at build or run time.
 #
-#   make                 # configure + build      -> cpp/build/mmfree-cli
+#   make                 # configure + build      -> build/mmfree-cli
 #   make model           # download + pack a checkpoint (needs the tools/ deps once)
 #   make run PROMPT="Hello there"
 #   make bench
@@ -17,7 +17,12 @@
 
 # ─── knobs (override on the command line: `make build SIMD=SCALAR`) ──────────────
 SRC        := cpp
-BUILD      ?= cpp/build
+# Build tree at the repo ROOT, not cpp/build/ — one `build/` next to the Makefile you type
+# `make` in. The source dir stays cpp/, so this is a plain out-of-source build either way;
+# only the output location moved. Override with BUILD=<dir> (the old layout is still just
+# `make BUILD=cpp/build`). The CLI's blob auto-discovery handles both — see
+# search_model_file() in cpp/app/main.cpp.
+BUILD      ?= build
 BUILD_TYPE ?= Release
 # getconf is POSIX and works on both Linux and macOS (nproc is Linux-only).
 JOBS       ?= $(shell getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)

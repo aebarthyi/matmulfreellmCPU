@@ -12,7 +12,8 @@ cpp/golden
 cpp/golden_fixedp
 
 # --- build trees ----------------------------------------------------------------
-# Out-of-source (the documented layout: cpp/build/) and any other build dir.
+# Out-of-source (the documented layout: ./build/) and any other build dir, at any depth —
+# so the older cpp/build/ trees stay ignored too.
 build/
 # ...and the litter an accidental in-source `cmake .` inside cpp/ leaves behind.
 # NOTE: anchored to cpp/. An unanchored `Makefile`/`CMakeFiles` here would also hide
