@@ -209,6 +209,41 @@ Two things to know when reading the numbers:
 `--mode float` ignores batching for the matmul (the backend seam is integer-only) and says
 so; the streams still run, just without the weight reuse.
 
+#### What it buys, measured
+
+370M on a 20-core Xeon, `--gen 128 --reps 5`, aggregate decode tok/s (two passes):
+
+| weights | b=1 | b=2 | b=4 | b=8 | b=8 vs b=1 |
+|:--|--:|--:|--:|--:|--:|
+| `int8`   | 112.6 / 103.5 | 163.5 / 149.7 | 177.5 / 163.5 | 204.0 / 199.1 | 1.81x / 1.92x |
+| `2bit`   | 108.1 / 100.6 | 163.9 / 193.0 | 173.4 / 160.7 | 224.3 / 206.3 | 2.08x / 2.05x |
+| `1.6bit` | 107.7 /  99.3 | 152.9 / 137.7 | 158.6 / 146.7 | 199.1 / 186.0 | 1.85x / 1.87x |
+
+Roughly a 2x aggregate win at b=8. Absolute cells carry ~8% run-to-run spread (the `2bit`
+b=2 cell is visibly bimodal — do not quote it), but the *ratio* is stable across passes and
+formats, which is the part that is really being claimed here.
+
+**The knee is at b~10, not at the thread count.** A b=1..40 ladder (`--gen 32 --reps 1`,
+shape-finding only) climbs steeply to b~5, reaches ~220 tok/s by b~10, and is then flat
+through b=40 — every cell in b=10..40 sits inside the noise band. Exceeding the core count
+costs nothing in aggregate; it simply stops paying:
+
+| b | 1 | 2 | 5 | 10 | 20 | 30 | 40 |
+|:--|--:|--:|--:|--:|--:|--:|--:|
+| aggregate  | 100.8 | 147.9 | 199.3 | 219.4 | 212.9 | 224.7 | 226.3 |
+| per stream | 100.8 |  73.9 |  39.9 |  21.9 |  10.6 |   7.5 |   5.7 |
+
+The reason threads are not the limit: OpenMP already parallelizes over the M output rows
+(thousands of them), so the cores are saturated at b=1. Batching's only job is amortizing
+weight traffic, and once a weight row is reused ~8-10 times that stops being the bottleneck
+and the kernel goes compute-bound. Past the knee you pay per-stream latency — which degrades
+linearly, forever — for no aggregate gain, so **b~8-12 is the operating point** on a host
+this size. Prefill saturates identically: 112 ms/prompt at b=1, ~56 ms from b~10 on.
+
+These are x86 numbers. A 4-core Cortex-A53 knees much earlier and quantizes into scheduling
+waves over the batch, so the board needs its own ladder rather than a scaled copy of this
+one.
+
 Threading follows OpenMP: `OMP_NUM_THREADS=4 mmfree-cli ...`. Only independent rows and
 disjoint elementwise ranges are parallelized, never a floating-point reduction, so thread
 count does not change the output (`include/mmfree/parallel.hpp`).
