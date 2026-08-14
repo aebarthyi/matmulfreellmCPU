@@ -41,7 +41,7 @@ python tools/provision.py                       # -> cpp/{model.mmfree,tokenizer
 | | needed for | notes |
 |---|---|---|
 | C++17 compiler + CMake ≥ 3.16 | building the engine | GCC, Clang, or AppleClang |
-| OpenMP | multi-threading | optional; without it the build is correct but single-threaded |
+| OpenMP | multi-threading | optional; without it the build is correct but single-threaded. macOS: `brew install libomp` (keg-only — CMake finds it for you) |
 | GNU make | the `Makefile` wrapper | optional; macOS ships it as `make`, *BSD as `gmake` |
 | Python 3.8+ with numpy | provisioning a checkpoint | one-time, offline; not needed at run time |
 | torch + safetensors | the reference weight packer | skippable — see [`--no-torch`](#provisioning-without-torch) |
@@ -301,7 +301,7 @@ float and fixed-point numeric modes.
 |---|---|
 | `error: no weight blob found` | not provisioned yet — `make model`, or pass `--blob` |
 | `Illegal instruction` / `SIGILL` | binary built on a newer CPU than it runs on. Rebuild with `make build SIMD=SCALAR` (or `SIMD=X86`) |
-| `OpenMP not found` warning, slow | AppleClang has no OpenMP runtime: `brew install libomp`, then re-run cmake. Debian/Ubuntu with clang: `apt install libomp-dev` |
+| `OpenMP not found` warning, slow | AppleClang ships no OpenMP runtime: `brew install libomp`, then re-run cmake — CMake locates the keg-only install itself. If it still misses (non-standard Homebrew prefix), pass `-DOpenMP_ROOT=$(brew --prefix libomp)`. Debian/Ubuntu with clang: `apt install libomp-dev` |
 | slower than expected on x86 | check the configure line says `SIMD backend: X86_512`; if it says `X86`, this CPU has no AVX-512 |
 | `unsupported safetensors dtype` from `--no-torch` | the checkpoint isn't BF16/F16/F32 — drop `--no-torch` |
 | CMake warning about Win32 | native Windows isn't supported; build under WSL |

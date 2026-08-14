@@ -164,6 +164,40 @@ endif()
 # Threading: parallelize the ternary matmul over output rows (see bitlinear.cpp).
 # Optional -- without OpenMP the pragmas are ignored and the build stays single-threaded
 # (and still correct, just slower; see include/mmfree/parallel.hpp).
+#
+# macOS needs help before we can even ask. AppleClang ships no OpenMP runtime, and
+# `brew install libomp` alone does NOT make find_package(OpenMP) succeed, for two
+# independent reasons:
+#   1. libomp is KEG-ONLY -- Homebrew deliberately does not symlink it into
+#      {/opt/homebrew,/usr/local}/{include,lib}, so the headers and dylib are not on any
+#      default search path.
+#   2. AppleClang rejects a bare `-fopenmp`; the OpenMP pragmas are only enabled through
+#      `-Xpreprocessor -fopenmp`, which is not the spelling FindOpenMP tries first.
+# So fill in the three hint variables FindOpenMP consults, and only then call it. Doing this
+# BEFORE find_package matters -- afterwards they are already cached as not-found.
+if(APPLE)
+  # `brew --prefix libomp` is authoritative (handles Apple-silicon vs Intel prefixes and a
+  # non-standard HOMEBREW_PREFIX); the hardcoded pair is the fallback when brew is not on
+  # PATH, e.g. a CI runner with a bare Homebrew install.
+  find_program(MMFREE_BREW brew)
+  if(MMFREE_BREW)
+    execute_process(COMMAND ${MMFREE_BREW} --prefix libomp
+                    OUTPUT_VARIABLE MMFREE_BREW_LIBOMP
+                    OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+  endif()
+  foreach(cand "${MMFREE_BREW_LIBOMP}" /opt/homebrew/opt/libomp /usr/local/opt/libomp)
+    if(NOT "${cand}" STREQUAL "" AND NOT MMFREE_LIBOMP AND EXISTS "${cand}/include/omp.h")
+      set(MMFREE_LIBOMP "${cand}")
+    endif()
+  endforeach()
+  if(MMFREE_LIBOMP AND NOT DEFINED OpenMP_CXX_FLAGS)
+    message(STATUS "mmfree: using Homebrew libomp at ${MMFREE_LIBOMP}")
+    set(OpenMP_ROOT "${MMFREE_LIBOMP}")  # honoured by CMake >= 3.20
+    set(OpenMP_CXX_FLAGS "-Xpreprocessor -fopenmp -I${MMFREE_LIBOMP}/include")
+    set(OpenMP_CXX_LIB_NAMES omp)
+    set(OpenMP_omp_LIBRARY "${MMFREE_LIBOMP}/lib/libomp.dylib")
+  endif()
+endif()
 find_package(OpenMP)
 if(OpenMP_CXX_FOUND)
   target_link_libraries(mmfreecpu PUBLIC OpenMP::OpenMP_CXX)
@@ -172,7 +206,9 @@ else()
   # Worth a loud line: the usual cause is AppleClang, which ships no OpenMP runtime, and
   # the only symptom otherwise is single-core throughput.
   message(WARNING "OpenMP not found — building SINGLE-THREADED (correct, but much slower).\n"
-                  "  macOS:  brew install libomp   (then re-run cmake)\n"
+                  "  macOS:  brew install libomp   (then re-run cmake; this file locates a\n"
+                  "          keg-only libomp automatically. If it still misses, point at it:\n"
+                  "          -DOpenMP_ROOT=$(brew --prefix libomp))\n"
                   "  Debian: sudo apt install libomp-dev  (clang)  /  g++ has it built in")
 endif()
 
