@@ -16,7 +16,7 @@ const std::string kUnderscore = "\xE2\x96\x81";  // U+2581 "▁"
 std::uint32_t read_u32(std::ifstream& f) {
   std::uint32_t v;
   f.read(reinterpret_cast<char*>(&v), 4);
-  return v;  // pack_tokenizer writes little-endian; build hosts are LE.
+  return v;  // provision.py writes little-endian; assumes a little-endian host.
 }
 std::int32_t read_i32(std::ifstream& f) {
   std::int32_t v;
@@ -126,10 +126,8 @@ std::vector<std::int64_t> Tokenizer::encode(const std::string& text, bool add_bo
     if (sym[b.left].text.empty() || sym[b.right].text.empty()) continue;
     if (sym[b.left].next != b.right) continue;
     // Re-verify against the CURRENT texts: either endpoint may have grown via an earlier
-    // merge, so this queued pair could no longer be the merge we think it is. Only proceed
-    // if the live pair still maps to exactly this merge rank (the fresh pair, if any, was
-    // queued separately). Without this, two grown symbols get blindly concatenated into a
-    // non-vocab piece -> spurious byte-fallback.
+    // merge. Without this, grown symbols get concatenated into a non-vocab piece and fall
+    // back to bytes.
     auto mr = merge_rank_.find(sym[b.left].text + " " + sym[b.right].text);
     if (mr == merge_rank_.end() || mr->second != b.rank) continue;
     sym[b.left].text += sym[b.right].text;  // merged piece (guaranteed in vocab)

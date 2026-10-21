@@ -1,26 +1,17 @@
-// main.cpp — mmfree-cli: run HGRN-Bit / MMfreeLM inference from the command line.
+// main.cpp — mmfree-cli: HGRN-Bit / MMfreeLM inference from the command line.
 //
-// Consolidated text-in / text-out tool. The common case is a text prompt:
-//   mmfree-cli "The capital of France is"           # -> generated text on stdout
-//   echo "Once upon a time," | mmfree-cli           # prompt from stdin
-// It tokenizes (embedded LLaMA BPE, mmfree/tokenizer.hpp), generates greedily with the
-// recurrent-state cache, stops at </s> or --gen, and decodes the new tokens back to text.
-//
-// A raw-ids path is kept for validation/debugging (tools/compare_prompts.py):
-//   mmfree-cli --ids 1,415,310 --gen 8              # ids in -> full id stream out
-// In --ids mode there is no tokenizer dependency and no EOS stop (exactly --gen tokens),
-// so the greedy stream stays directly comparable to the reference.
-//
-// The flag reference is kUsage below (printed by `--help`), so there is one copy of it.
+// Text in / text out: tokenize (mmfree/tokenizer.hpp), generate with the recurrent-state
+// cache, stop at </s> or --gen, stream the decoded tokens. `--ids` is the raw-ids
+// validation path: no tokenizer and no EOS stop, so exactly --gen tokens.
+// The flag reference is kUsage below (printed by --help).
+#include "cli_common.hpp"
 #include "mmfree/bench.hpp"
 #include "mmfree/model.hpp"
 #include "mmfree/profile.hpp"
 #include "mmfree/tokenizer.hpp"
-#include "mmfree/tq1.hpp"  // Tq1Backend / Tq2Backend: --weights 1.6bit|2bit
 #include "mmfree/weights.hpp"
 
 #include <cctype>
-#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <exception>
@@ -41,21 +32,26 @@ usage: mmfree-cli [flags] ["prompt text"]
        echo "prompt" | mmfree-cli [flags]
 
   mmfree-cli "The capital of France is" --gen 32
+  mmfree-cli --model 2.7B "The capital of France is"
   mmfree-cli --bench --gen 128 --reps 5          # timing run, fixed prompt
   mmfree-cli --ids 1,415,310 --gen 8             # raw ids in/out (no tokenizer, no EOS)
   mmfree-cli --bench --batch 8 --gen 128         # batched (8-stream) throughput
 
 model files
-  --blob PATH        weight blob (default: $MMFREE_BLOB, else model.mmfree looked up in
-                     the working dir, then next to the executable and its parent dirs)
+  --model SIZE       370M | 1.3B | 2.7B: use blobs/<SIZE>/ (default: the smallest
+                     provisioned). `make model MODEL=<SIZE>` provisions one.
+  --blob PATH        weight blob, instead of --model (also: $MMFREE_BLOB)
   --tokenizer PATH   tokenizer blob (default: $MMFREE_TOKENIZER, else tokenizer.mmtok
                      beside the weight blob)
-  Both are produced by tools/provision.py — see the README.
 
 generation
   --gen N            max new tokens                        (default 32)
   --temp T           sampling temperature, 0 = greedy       (default 0)
   --top-k K          sample from the K highest logits, 0 = full vocab (needs --temp > 0)
+  --top-p P          sample from the smallest set of tokens holding mass P (needs
+                     --temp > 0; 1 = off, the default)
+  --repeat-penalty R discourage tokens seen in the last --repeat-last-n (default 64)
+                     tokens; 1 = off (default), ~1.1-1.3 curbs the loops these models fall into
   --seed N           RNG seed for sampling                  (default: random each run)
   --no-bos           do not prepend BOS in text mode
   --no-eos           do not stop at EOS in text mode
@@ -97,48 +93,6 @@ benchmarking
   -h, --help         this message
 )";
 
-static bool file_exists(const std::string& p) {
-  std::ifstream f(p, std::ios::binary);
-  return f.good();
-}
-
-// Directory holding the running executable, derived from argv[0] ("" if argv[0] carries no
-// path — e.g. an installed binary found through PATH; the working-dir candidates and
-// --blob/$MMFREE_BLOB still cover that case).
-static std::string exe_dir(const char* argv0) {
-  std::string p = argv0 ? argv0 : "";
-  std::size_t slash = p.find_last_of('/');
-  return (slash == std::string::npos) ? "" : p.substr(0, slash);
-}
-
-// Find `name` in the usual places so the engine runs from wherever it was built or
-// installed, not only from the directory holding the blob. In build-tree layouts the
-// binary sits in build/ (or build/Release/, or the older cpp/build/) while `make model`
-// writes the blob to cpp/, hence walking a couple of parents AND checking a cpp/ sibling:
-// from build/ the blob is at ../cpp/, from cpp/build/ it is at ../. Returns "" if nothing
-// matched. Order is cheapest-and-most-specific first; every candidate is one stat.
-static std::string search_model_file(const std::string& name, const char* argv0) {
-  std::vector<std::string> dirs = {".", "./cpp"};
-  std::string ed = exe_dir(argv0);
-  if (!ed.empty()) {
-    dirs.push_back(ed);
-    dirs.push_back(ed + "/..");
-    dirs.push_back(ed + "/../cpp");
-    dirs.push_back(ed + "/../..");
-    dirs.push_back(ed + "/../../cpp");
-  }
-  for (const std::string& d : dirs) {
-    std::string cand = d + "/" + name;
-    if (file_exists(cand)) return cand;
-  }
-  return "";
-}
-
-static const char* env_or_null(const char* k) {
-  const char* v = std::getenv(k);
-  return (v && *v) ? v : nullptr;
-}
-
 static std::vector<std::int64_t> parse_ids(const std::string& s) {
   std::vector<std::int64_t> ids;
   std::size_t i = 0;
@@ -154,15 +108,8 @@ static std::vector<std::int64_t> parse_ids(const std::string& s) {
   return ids;
 }
 
-// "<dir>/tokenizer.mmtok" alongside the weight blob.
-static std::string default_tokenizer_path(const std::string& blob) {
-  std::size_t slash = blob.find_last_of('/');
-  std::string dir = (slash == std::string::npos) ? "" : blob.substr(0, slash + 1);
-  return dir + "tokenizer.mmtok";
-}
-
 static int run(int argc, char** argv) {
-  std::string blob, tokenizer_path, mode = "fixed", ids_arg, logits_out, wfmt = "int8";
+  std::string blob, size, tokenizer_path, mode = "fixed", ids_arg, logits_out, wfmt = "int8";
   std::string prompt, decode_arg;
   bool have_prompt = false, no_bos = false, no_eos = false, print_ids = false,
        show_ids = false, bench = false, profile = false;
@@ -177,6 +124,7 @@ static int run(int argc, char** argv) {
     std::string k = argv[a];
     auto next = [&]() { return (a + 1 < argc) ? argv[++a] : ""; };
     if (k == "--blob") blob = next();
+    else if (k == "--model" || k == "-m") size = next();
     else if (k == "--tokenizer") tokenizer_path = next();
     else if (k == "--mode") mode = next();
     else if (k == "--weights") wfmt = next();
@@ -184,6 +132,9 @@ static int run(int argc, char** argv) {
     else if (k == "--gen") gen = static_cast<std::size_t>(std::atoll(next()));
     else if (k == "--temp" || k == "--temperature") samp.temperature = std::atof(next());
     else if (k == "--top-k") samp.top_k = std::atoi(next());
+    else if (k == "--top-p") samp.top_p = std::strtof(next(), nullptr);
+    else if (k == "--repeat-penalty") samp.repeat_penalty = std::strtof(next(), nullptr);
+    else if (k == "--repeat-last-n") samp.repeat_last_n = std::strtoull(next(), nullptr, 10);
     else if (k == "--seed") { samp.seed = std::strtoull(next(), nullptr, 10); have_seed = true; }
     else if (k == "--ids") ids_arg = next();
     else if (k == "--decode-ids") decode_arg = next();
@@ -207,13 +158,12 @@ static int run(int argc, char** argv) {
     }
   }
 
-  // Validate the enum-valued flags before touching a multi-GB blob. `--mode` in particular
-  // used to accept anything and silently mean "float", which quietly changes the numerics.
+  // Validate the enum-valued flags before touching a multi-GB blob.
   if (mode != "fixed" && mode != "float") {
     std::fprintf(stderr, "error: unknown --mode %s (expected fixed or float)\n", mode.c_str());
     return 2;
   }
-  if (wfmt != "int8" && wfmt != "1.6bit" && wfmt != "2bit") {
+  if (!cli::valid_weight_format(wfmt)) {
     std::fprintf(stderr, "error: unknown --weights %s (expected int8, 1.6bit, or 2bit)\n",
                  wfmt.c_str());
     return 2;
@@ -223,45 +173,16 @@ static int run(int argc, char** argv) {
     return 2;
   }
 
-  // Resolve the model files: explicit flag > environment > search. Report a miss here
-  // rather than letting Weights/Tokenizer throw "cannot open model.mmfree", because at
-  // this point we still know WHERE we looked and what would fix it.
-  //
-  // The weight blob is only *required* by the paths that actually run the model -- the
-  // tokenizer-only paths (--decode-ids, `--gen 0 --print-ids`) must keep working on a
-  // machine that has never provisioned one.
+  // Resolve the model files: flag > environment > search. A missing blob is reported here,
+  // where we still know where we looked; the tokenizer-only paths (--decode-ids,
+  // `--gen 0 --print-ids`) must work without one.
   const bool need_blob = decode_arg.empty() && (gen > 0 || !logits_out.empty() || bench);
-  if (blob.empty()) {
-    if (const char* e = env_or_null("MMFREE_BLOB")) {
-      blob = e;
-    } else {
-      blob = search_model_file("model.mmfree", argv[0]);
-      if (blob.empty() && need_blob) {
-        std::fprintf(stderr,
-                     "error: no weight blob found (looked for model.mmfree in the working "
-                     "directory and next to the executable).\n"
-                     "  provision one:  python tools/provision.py\n"
-                     "  or point at it: mmfree-cli --blob /path/to/model.mmfree  "
-                     "(or set MMFREE_BLOB)\n");
-        return 2;
-      }
-    }
-  }
-  if (tokenizer_path.empty()) {
-    if (const char* e = env_or_null("MMFREE_TOKENIZER")) {
-      tokenizer_path = e;
-    } else {
-      // Beside the blob first; then the same search the blob used, so a build-tree
-      // tokenizer.mmtok is found even when --blob points into a model zoo (or when there
-      // is no blob at all). Falling back to the bare name lets Tokenizer report the miss.
-      if (!blob.empty()) tokenizer_path = default_tokenizer_path(blob);
-      if (tokenizer_path.empty() || !file_exists(tokenizer_path)) {
-        std::string found = search_model_file("tokenizer.mmtok", argv[0]);
-        if (!found.empty()) tokenizer_path = found;
-        else if (tokenizer_path.empty()) tokenizer_path = "tokenizer.mmtok";
-      }
-    }
-  }
+  cli::ModelPaths mp;
+  if (int rc = cli::resolve_model(blob, size, tokenizer_path, argv[0], need_blob,
+                                  "mmfree-cli", mp))
+    return rc;
+  blob = mp.blob;
+  tokenizer_path = mp.tokenizer;
 
   // --decode-ids: pure tokenizer decode, no weights/model needed.
   if (!decode_arg.empty()) {
@@ -300,8 +221,7 @@ static int run(int argc, char** argv) {
     return 2;
   }
 
-  // Build the model only when we actually run it (skip for pure tokenization, e.g.
-  // `--gen 0 --print-ids`, so no weight blob is needed for that path).
+  // Build the model only when it runs (pure tokenization needs no weight blob).
   ActQuant aq = (mode == "fixed") ? ActQuant::FixedQ510 : ActQuant::Float;
   std::unique_ptr<Weights> w;
   std::unique_ptr<Model> model;
@@ -310,54 +230,9 @@ static int run(int argc, char** argv) {
     model = std::make_unique<Model>(*w, aq, frac);
   }
 
-  // ---- --weights: install a packed ternary backend (mmfree/tq1.hpp) ----------------
-  // These repack each projection from the blob's int8 on first touch and cache it keyed on
-  // the mmap'd pointer, so the one-off cost lands on the first token — which --warmup
-  // absorbs in --bench. The packing is lossless and integer addition is associative, so
-  // the int32 accumulators, and therefore the logits, are bit-identical to int8 (proved
-  // over the whole input domain by cpp/tests/test_tq1.cpp). No blob change is involved:
-  // the same model.mmfree serves all three formats.
-  // set_backend's proj_ids map stays empty — it exists for backends with resident
-  // per-projection weights (the FPGA); the CPU backends ignore proj_id.
-  // --batch rides along on the same seam: the batch width is a property of the backend
-  // (batch_size()), which is what bitlinear chunks its rows by. int8 normally runs with NO
-  // backend installed (bitlinear falls back to an internal CpuBackend), so a batched int8
-  // run has to install one explicitly — it is the very same class, just constructed with a
-  // width, so this does not change the arithmetic.
-  std::unique_ptr<CpuBackend> cpu;
-  std::unique_ptr<Tq1Backend> tq1;
-  std::unique_ptr<Tq2Backend> tq2;
-  if (model && batch > 1 && aq != ActQuant::FixedQ510) {
-    // Same honesty rule as --weights: the float path never consults the backend, so the
-    // streams would run but the batching would not be doing anything.
-    std::fprintf(stderr, "warning: --batch %zu does not batch the matmul in --mode float "
-                         "(the backend seam is integer-only); streams run independently\n",
-                 batch);
-  }
-  if (model && wfmt != "int8") {
-    if (aq != ActQuant::FixedQ510) {
-      // bitlinear only consults the backend on the integer path, so honouring --weights
-      // here would be a lie. Say so instead of silently running int8.
-      std::fprintf(stderr, "warning: --weights %s is ignored in --mode float "
-                           "(the packed kernels are integer-only); using int8\n",
-                   wfmt.c_str());
-    } else if (wfmt == "1.6bit") {
-      tq1 = std::make_unique<Tq1Backend>(batch);
-      model->set_backend(tq1.get(), {});
-      std::fprintf(stderr, "weight format: %s, %.4f bits/weight (%zu-weight blocks, %zu B)\n",
-                   Tq1Backend::format_name(), Tq1Backend::format_bits(),
-                   tq1::kBlockElems, tq1::kBlockBytes);
-    } else {  // 2bit
-      tq2 = std::make_unique<Tq2Backend>(batch);
-      model->set_backend(tq2.get(), {});
-      std::fprintf(stderr, "weight format: %s, %.4f bits/weight (%zu-weight blocks, %zu B)\n",
-                   Tq2Backend::format_name(), Tq2Backend::format_bits(),
-                   tq2::kBlockElems, tq2::kBlockBytes);
-    }
-  } else if (model && batch > 1 && aq == ActQuant::FixedQ510) {
-    cpu = std::make_unique<CpuBackend>(batch);
-    model->set_backend(cpu.get(), {});
-  }
+  // ---- --weights / --batch: install a TernaryBackend (cli_common.hpp) ----
+  cli::Backends backends;
+  if (model) cli::install_backend(*model, wfmt, aq, batch, backends);
 
   // ---- benchmark mode: time generation, report prefill/decode tok/s, then exit ----
   if (bench) {
@@ -376,12 +251,8 @@ static int run(int argc, char** argv) {
   if (samp.temperature > 0.0f && !have_seed) samp.seed = std::random_device{}();
 
   // ---- --batch B (non-bench): decode B streams in lockstep and print each -------------
-  // Kept separate from the single-stream path below rather than folded into it: per-token
-  // text streaming re-decodes the whole stream to emit a byte suffix, which cannot be
-  // interleaved across B streams without garbling them. So batched runs print per stream
-  // once complete. Greedy + one prompt => every stream must come out identical, which is
-  // the cheap self-check on the batched kernel (a real permutation check needs distinct
-  // rows — cpp/tests/test_tq1.cpp does that).
+  // Per-token streaming can't interleave B streams, so each prints once complete. With one
+  // prompt + greedy every stream must come out identical (a cheap self-check).
   if (batch > 1 && gen > 0) {
     std::int64_t eos_b = (!ids_mode && !no_eos && tok) ? tok->eos_id() : -1;
     std::vector<std::vector<std::int64_t>> prompts(batch, ids);
@@ -406,10 +277,8 @@ static int run(int argc, char** argv) {
     return 0;
   }
 
-  // Stream decoded text token-by-token (text-output mode only). BPE decode isn't safe
-  // per-token (▁->space, leading-space strip, multi-byte/byte-fallback fusion), so we
-  // re-decode the generated-so-far each step and emit only the new byte suffix -- always
-  // byte-correct because decode is prefix-stable for this tokenizer.
+  // Stream decoded text token by token. BPE pieces don't decode independently, so re-decode
+  // the generated-so-far each step and emit the new byte suffix (decode is prefix-stable).
   const bool stream_text = !ids_out;
   std::vector<std::int64_t> shown_ids;
   std::string shown;
@@ -468,17 +337,9 @@ static int run(int argc, char** argv) {
 }
 
 int main(int argc, char** argv) {
-  // Weights/Tokenizer report bad or missing blobs by throwing; catching here turns what
-  // was an uncaught-exception abort into one actionable line.
   try {
     return run(argc, argv);
   } catch (const std::exception& e) {
-    std::string msg = e.what();
-    std::fprintf(stderr, "error: %s\n", msg.c_str());
-    if (msg.compare(0, 9, "weights: ") == 0 || msg.compare(0, 11, "tokenizer: ") == 0)
-      std::fprintf(stderr,
-                   "hint: the model files come from `python tools/provision.py` "
-                   "(see the README); pass --blob/--tokenizer to point elsewhere.\n");
-    return 1;
+    return cli::report_error(e);
   }
 }

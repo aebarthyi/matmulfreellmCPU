@@ -1,17 +1,11 @@
 // mmfree/ternary_backend.hpp — pluggable ternary-matmul backend for BitLinear.
 //
-// The integer (FixedQ510) BitLinear projection reduces to one op:
+// The integer (FixedQ510) projection reduces to the one op an accelerator replaces
+// (RMSNorm, quant and dequant stay on the CPU around it):
 //   acc[o] = sum_{n<N} x[n] * wq[o*N + n],   o in [0,M),   wq[.] in {-1,0,+1} (int8).
-// This is the only part of the model that an accelerator replaces (RMSNorm, the int16
-// quant, and the dequant all stay on the CPU around it). `TernaryBackend` is that seam.
-//
-// Activation contract: `x` carries int16-range integer activations (the Q5.10 codes
-// produced in bitlinear.cpp), stored as int32. The CPU backend consumes them directly;
-// an FPGA backend (KRIA repo) narrows them to int16 losslessly — the values are already
-// saturated to [-32768, 32767]. `proj_id` identifies the projection for backends that
-// hold resident per-projection weights (FPGA); the CPU backend ignores it and uses the
-// `wq` pointer passed by the caller. Keeping the int32/`wq` shape here lets the CPU path
-// call simd::ternary_dot_i32 verbatim — bit-identical to the historical inline loop.
+// `x` holds int16-range Q5.10 codes stored as int32, so an FPGA backend can narrow them to
+// int16 losslessly. `proj_id` addresses resident per-projection weights (FPGA); CPU backends
+// ignore it and use `wq`.
 #pragma once
 
 #include "mmfree/simd.hpp"
@@ -30,16 +24,12 @@ struct TernaryBackend {
   virtual void matmul(int proj_id, const std::int32_t* x, std::int32_t* acc,
                       const std::int8_t* wq, std::size_t N, std::size_t M) = 0;
 
-  // Preferred batch width: how many activation vectors this backend wants per call.
-  // 1 for the CPU (no win) and the b=1 bitstream; the spatial-batch FPGA returns its
-  // CoreConfig.batchSize so bitlinear chunks prefill rows into that many per call. The
-  // weight-streaming FPGA streams the resident weights ONCE per matmul_batch and applies
-  // them to all `b` rows — the whole point of batching (amortizes the DDR weight wall).
+  // Preferred batch width: activation rows per call (bitlinear chunks its rows by this).
+  // A batching backend fetches each weight once per matmul_batch and applies it to all rows.
   virtual std::size_t batch_size() const { return 1; }
 
-  // Fill acc[i*M + m] for b activation vectors x[i*N + n] (i in [0,b)), row-major. Default
-  // loops the scalar matmul per row, so any backend that doesn't override it (CpuBackend)
-  // is bit-identical to the per-row path. `b` is <= batch_size().
+  // Fill acc[i*M + m] for b activation vectors x[i*N + n] (i in [0,b)), row-major;
+  // b <= batch_size(). The default loops matmul() per row.
   virtual void matmul_batch(int proj_id, const std::int32_t* x, std::int32_t* acc,
                             const std::int8_t* wq, std::size_t N, std::size_t M,
                             std::size_t b) {
@@ -47,16 +37,10 @@ struct TernaryBackend {
       matmul(proj_id, x + i * N, acc + i * M, wq, N, M);
   }
 
-  // As matmul_batch, but the backend may report completion in COLUMN RANGES as they become
-  // available instead of only at the end: on_cols(col0, ncols) says acc[i*M + col0 ..
-  // col0+ncols) is final for every row i. A backend that computes the projection in output-
-  // column pieces (the FPGA splits it into column tiles) calls this DURING the projection,
-  // so the caller's per-column work — dequant here, elementwise ops later — runs while the
-  // engine is still busy on the next piece instead of after the whole projection.
-  //
-  // The default is one call covering [0,M) after the whole matmul, i.e. exactly the
-  // un-chunked behaviour, so CpuBackend and any non-overriding backend are unchanged. The
-  // callback must be invoked for every column exactly once, whatever the piece order.
+  // As matmul_batch, but completion may be reported in column ranges: on_cols(col0, ncols)
+  // means acc[i*M + col0 .. col0+ncols) is final for every row i, so the caller's per-column
+  // work (dequant) can overlap the rest of the projection. Every column must be reported
+  // exactly once; the default reports [0,M) after the whole matmul.
   virtual void matmul_batch_chunked(int proj_id, const std::int32_t* x, std::int32_t* acc,
                                     const std::int8_t* wq, std::size_t N, std::size_t M,
                                     std::size_t b,
@@ -65,16 +49,11 @@ struct TernaryBackend {
     if (on_cols) on_cols(0, M);
   }
 
-  // Run k projections that share dims (N,M,b) as a CLUSTER (e.g. i/f/g, all reading
-  // the same RMSNorm input). For each j in [0,k): produce(j, xq) fills b*N int32
-  // activations for projection j, the backend accumulates acc[b*M], then
-  // consume(j, acc) consumes it. proj_ids[j] addresses resident weights (FPGA);
-  // wqs[j] is the CPU weight matrix [M,N] (the default/CPU path uses it).
-  //
-  // The default runs strictly serial (produce -> matmul_batch -> consume), so it is
-  // BIT-IDENTICAL to k independent matmul_batch calls. A backend whose per-call cost
-  // splits into engine work and overlappable CPU work (FPGA) overrides this to slot
-  // produce(n+1)/consume(n-1) into the engine's wait windows.
+  // Run k projections sharing (N,M,b) as a cluster (e.g. i/f/g on the same input): for each
+  // j, produce(j, xq) fills b*N activations, the backend accumulates b*M, and consume(j, acc)
+  // takes the result. proj_ids[j] / wqs[j] address the weights. The default is strictly
+  // serial (bit-identical to k matmul_batch calls); an overlapping backend may interleave
+  // produce/consume with engine work.
   virtual void matmul_seq(const int* proj_ids, const std::int8_t* const* wqs, int k,
                           const std::function<void(int, std::int32_t*)>& produce,
                           const std::function<void(int, const std::int32_t*)>& consume,
@@ -90,25 +69,11 @@ struct TernaryBackend {
   virtual ~TernaryBackend() = default;
 };
 
-// CPU reference: the original per-output int32 ternary reduction. Parallelized over output
-// rows exactly as the inline loop in bitlinear.cpp was, so results are bit-identical and
-// independent of lane/row order (integer accumulation is associative).
-//
-// BATCHING. `batch` > 1 makes bitlinear hand this backend b activation rows per call, which
-// it walks WEIGHT-ROW-OUTER / batch-inner: each weight row wq[o] is fetched once and reused
-// for all b activations while it is still hot in L1/L2, instead of the whole [M,N] matrix
-// being re-swept once per row. Weight traffic per token therefore falls ~b-fold, which is
-// the same reason batching pays on the FPGA — there the resident weights stream once per
-// matmul_batch, here they land once in cache.
-//
-// Every acc[i*M + o] is still exactly `ternary_dot_i32(x + i*N, wq + o*N, N)` — the same
-// call with the same operands as the per-row path, only issued in a different order. The
-// results are therefore BIT-IDENTICAL to batch=1, not merely close, so a batched run stays
-// a valid reference for the CPU==FPGA gate. cpp/tests/test_tq1.cpp checks this with
-// DISTINCT activation rows, which is what catches a row/column mix-up (identical rows
-// cannot see a permutation).
-//
-// Default 1 = the historical behaviour, so no existing measurement moves unless asked.
+// CPU reference: per-output int32 ternary reduction, parallel over output rows.
+// With batch > 1, matmul_batch walks weight-row-outer / batch-inner, so each weight row is
+// fetched once and reused across the b activation rows while hot in cache. Every
+// acc[i*M + o] is still the same ternary_dot_i32 call on the same operands, so results are
+// bit-identical to batch=1 (cpp/tests/test_tq1.cpp checks this with distinct rows).
 struct CpuBackend final : TernaryBackend {
   CpuBackend() = default;
   explicit CpuBackend(std::size_t batch) : batch_(batch ? batch : 1) {}

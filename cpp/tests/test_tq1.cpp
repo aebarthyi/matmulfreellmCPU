@@ -1,26 +1,17 @@
-// test_tq1.cpp — correctness of the CPU-side packed ternary weights (1.6-bit and 2-bit).
+// test_tq1.cpp — correctness of the packed ternary weights (mmfree/tq1.hpp: --weights
+// 1.6bit|2bit) and of batched matmul. No model blob or hardware needed: `make test`.
+// Links mmfreecpu to inherit its arch flags, so it exercises whichever SIMD path
+// (AVX-512 / AVX2 / NEON / scalar) the library was built for.
 //
-// These are the formats behind `mmfree-cli --weights 1.6bit|2bit` (mmfree/tq1.hpp). The
-// test needs no model blob and no hardware: `ctest -R tq1`, or `make test`.
-//
-// Runs on x86 AND on aarch64, so the same suite covers the AVX2/AVX-512 and the NEON
-// extraction paths — a packing bug on either would not crash, it would silently produce
-// plausible logits. Which path gets compiled follows the library's SIMD selection
-// (-DMMFREE_SIMD=..., see ../CMakeLists.txt), because this target links mmfreecpu and
-// inherits its PUBLIC arch flags.
-//
-// Four checks, in order of strength:
-//   1. EXHAUSTIVE encode/extract over the whole input domain: all 3^5 = 243 five-trit groups
-//      and all 3^4 = 81 four-trit groups. Also asserts the branchless compare form
-//      (q>=86)+(q>=171) equals llama.cpp's ((uint16)q*3)>>8 for every one of the 256*5 and
-//      256*4 (byte, position) pairs. This is a proof, not a sample.
-//   2. Round trip pack -> unpack over random ternary rows for every real MMfreeLM inner dim.
-//   3. dot_i32 EXACTLY equals simd::ternary_dot_i32 on the same weights. Exact, not close:
-//      the packing is lossless and integer addition is associative, so a differing summation
-//      order cannot move the result. This is the property the CPU==FPGA gate depends on.
-//   4. dot_f32 matches the scalar fp reference to reduction-order noise.
-//   5. batched matmul (mmfree-cli --batch) == per-row matmul, over DISTINCT rows so a
-//      row/column permutation cannot pass unnoticed.
+// Checks (numbered as printed):
+//   [1]  exhaustive encode/extract: all 243 five-trit and 81 four-trit groups, and the
+//        compare-form extraction == llama.cpp's ((uint16)q*3)>>8 for every (byte, position).
+//   [2]  pack -> unpack round trip for every real MMfreeLM inner dim.
+//   [3]  dot_i32 EXACTLY equals simd::ternary_dot_i32 (lossless + associative integer add);
+//        [3b] repeats it over 2000 random vectors.
+//   [4]  dot_f32 matches the fp reference to reduction-order noise.
+//   [5]  Tq1/Tq2Backend == CpuBackend over a full projection, incl. the non-256 fallback.
+//   [6]  batched matmul == per-row matmul, over DISTINCT rows so a permutation can't pass.
 #include "mmfree/simd.hpp"
 #include "mmfree/tq1.hpp"
 
@@ -29,7 +20,6 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
-#include <cstdlib>
 #include <random>
 #include <string>
 #include <vector>
@@ -257,16 +247,8 @@ void test_backend() {
 }
 
 // ---- batched matmul == per-row matmul, for every backend --------------------------------
-// The batched kernels (CpuBackend/PackedBackend::matmul_batch, driven by `mmfree-cli
-// --batch B`) only reorder the loops: weight row outer, batch inner, so each row is fetched
-// once and reused across the b activations. Every acc[i*M+o] is still the same
-// ternary_dot_i32 call on the same operands, so the results must be EXACT, not close.
-//
-// The rows here are DELIBERATELY DISTINCT. A batched kernel that mixes rows up — writes
-// acc[i] from x[j], or transposes the acc layout — is invisible to a check that feeds b
-// copies of one row, because every answer is then correct by accident. Distinct rows make
-// any permutation a hard mismatch. (Same trap as the board-side streams check: a shared
-// prompt cannot see a row swap.)
+// The batched kernels only reorder loops, so results must be EXACT. The rows are
+// deliberately DISTINCT: b copies of one row would hide a row/column permutation.
 void test_batch() {
   std::printf("[6] batched matmul == per-row matmul, distinct rows (N=1024, M=512, b=1..8)\n");
   const std::size_t N = 1024, M = 512, BMAX = 8;
@@ -334,10 +316,9 @@ void test_batch() {
               bad_odd == 0 ? "exact" : "MISMATCH");
 }
 
-// ---- optional microbenchmark (--bench): int8 vs TQ1_0 on a full projection --------------
-// The whole point of TQ1_0 here is weight TRAFFIC, so the benchmark must use a weight matrix
-// far bigger than L2 (1 MiB on the K26) — a cache-resident matrix would measure only the
-// extra unpack ALU work and conclude the opposite. Shapes below are real projections.
+// ---- optional microbenchmark (--bench): int8 vs TQ1_0 vs 2-bit on full projections -----
+// Real projection shapes, far larger than L2, so weight traffic is measured rather than
+// only the extra unpack work of a cache-resident matrix.
 void bench() {
   struct Shape { const char* name; std::size_t N, M; };
   const Shape shapes[] = {

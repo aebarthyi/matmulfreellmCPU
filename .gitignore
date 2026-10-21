@@ -3,7 +3,8 @@ __pycache__/
 *.pyc
 .venv/
 
-# --- provisioned model artifacts (regenerate with tools/provision.py) -----------
+# --- provisioned model artifacts: blobs/<size>/ (regenerate with tools/provision.py) ---
+/blobs/
 *.mmfree
 *.mmtok
 
@@ -12,12 +13,8 @@ cpp/golden
 cpp/golden_fixedp
 
 # --- build trees ----------------------------------------------------------------
-# Out-of-source (the documented layout: ./build/) and any other build dir, at any depth —
-# so the older cpp/build/ trees stay ignored too.
 build/
-# ...and the litter an accidental in-source `cmake .` inside cpp/ leaves behind.
-# NOTE: anchored to cpp/. An unanchored `Makefile`/`CMakeFiles` here would also hide
-# this repo's own tracked root Makefile.
+# in-source `cmake .` litter, anchored to cpp/ (unanchored would hide the root Makefile)
 /cpp/Makefile
 /cpp/CMakeCache.txt
 /cpp/CMakeFiles/

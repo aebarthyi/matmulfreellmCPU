@@ -1,51 +1,24 @@
-// mmfree/tq1.hpp — TQ1_0-style 1.6-bit ternary weights for the CPU backend.
+// mmfree/tq1.hpp — packed ternary weights for the CPU backend: TQ1_0 (1.625 bits/weight)
+// and 2-bit (tq2 below), plus PackedBackend, a TernaryBackend that repacks the blob's int8.
 //
-// WHY. The CPU ternary path stores each {-1,0,+1} weight as a full int8 (8 bits) and the
-// FixedQ510 projection is a straight `sum x[n] * wq[o*N + n]`. On the KRIA that loop is
-// partly DRAM-bound: a 370M decode step streams ~340 MB of int8 weights, a 2.7B step
-// ~2.6 GB. The FPGA arm already streams its weights at 1.6 bits (5 trits/byte), so the CPU
-// baseline was being measured against a 5x fatter weight representation. This header gives
-// the CPU the same trick, so a CPU-vs-FPGA comparison holds the weight format fixed.
-//
-// FORMAT. llama.cpp's TQ1_0 geometry (ggml-quants), which is where the arithmetic below
-// comes from: 256 weights per block, 5 trits per byte via base-3 packing (3^5 = 243 < 256),
-// with a 4-per-byte remainder because 256 is not a multiple of 5.
-//
-//   qs[0..31]   5 trits each -> elements  j + 32*l    (j<32, l<5)   = 160 elements
+// TQ1_0 is llama.cpp's TQ1_0 geometry minus its per-block fp16 scale (our scale_w is per
+// projection). 256 weights per block, base-3 packed (3^5 = 243 < 256):
+//   qs[0..31]   5 trits each -> elements  j + 32*l       (j<32, l<5) = 160 elements
 //   qs[32..47]  5 trits each -> elements  160 + j + 16*l (j<16, l<5) =  80 elements
 //   qh[0..3]    4 trits each -> elements  240 + j + 4*l  (j<4,  l<4) =  16 elements
-//   -> 52 bytes per 256 weights = 1.625 bits/weight
+//   -> 52 bytes per 256 weights
+// The l-th trit of a contiguous byte run maps to a contiguous element run, so one vector
+// load of weights pairs with one vector load of activations.
 //
-// The byte-group widths (32 / 16 / 4) are what make the extraction vectorize: the l-th trit
-// of a contiguous run of bytes maps to a CONTIGUOUS run of elements at offset 32*l (resp.
-// 16*l, 4*l), so one vector load of weights pairs with one vector load of activations.
+// Encode (u = trit + 1, u_0 first):  v = u_0*81 + u_1*27 + u_2*9 + u_3*3 + u_4  in [0, 242]
+//                                    q = ceil(v * 256 / 243) = (v*256 + 242) / 243
+// Decode trit l:  q_l = (uint8)(q * 3^l)   -- the mod-256 wrap drops the leading digits
+//                 u_l = (q_l >= 86) + (q_l >= 171)  == llama.cpp's ((uint16)q_l * 3) >> 8
+// cpp/tests/test_tq1.cpp checks the encoding and that equivalence over the whole domain.
 //
-// ONE DEVIATION from llama.cpp: TQ1_0 carries a per-block fp16 scale `d`; we drop it. Our
-// scale is per-projection (`scale_w`, applied once in bitlinear's dequant), so a per-block
-// scale would be redundant and would inflate 52 -> 54 bytes (1.6875 bits/weight). Nothing
-// here reads or writes gguf, so there is no interop to preserve.
-//
-// ENCODE. For a group of trits u_0..u_4 (u = trit + 1, so u in {0,1,2}, u_0 first-extracted):
-//   v = u_0*81 + u_1*27 + u_2*9 + u_3*3 + u_4        in [0, 242]
-//   q = ceil(v * 256 / 243) = (v*256 + 242) / 243     in [0, 255]
-// DECODE, extraction of trit l, no division and no lookup table:
-//   q_l = (uint8)(q * 3^l)            // deliberately wraps mod 256
-//   u_l = floor(3 * q_l / 256) = (q_l >= 86) + (q_l >= 171)
-// The wrap-around IS the algorithm: q/256 approximates the base-3 fraction 0.u_0u_1u_2u_3u_4,
-// multiplying by 3^l shifts l digits off the top (the mod-256 wrap discards them) and the
-// (q_l >= 86) + (q_l >= 171) pair is floor(3 * fraction) = the next digit. The compare form
-// is exactly equivalent to llama.cpp's ((uint16)q_l * 3) >> 8 but needs no widening, so it
-// maps onto one NEON vcgeq_u8 pair. Both the ceiling constant and the equivalence of the two
-// extraction forms are verified EXHAUSTIVELY (all 243 five-trit and 81 four-trit groups) by
-// software/integration/tests/test_tq1.cpp — that is a proof over the whole input domain, not
-// a sample.
-//
-// LOSSLESS, hence BIT-EXACT. Ternary values survive the round trip exactly (the test above),
-// so dot_i32 accumulates the same integer products as simd::ternary_dot_i32 — and integer
-// addition is associative, so even the different summation ORDER cannot change the result.
-// dot_i32 is therefore bit-identical to the int8 kernel, not merely close, which is what lets
-// the CPU==FPGA gate keep passing with this backend in place. (dot_f32 reorders an fp
-// reduction, exactly like the existing SIMD ternary_dot_f32 does versus scalar.)
+// Lossless, hence bit-exact: dot_i32 == simd::ternary_dot_i32 on the same weights (integer
+// addition is associative, so summation order cannot matter). dot_f32 differs from the
+// scalar reference only by fp reduction order.
 #pragma once
 
 #include "mmfree/parallel.hpp"
@@ -54,20 +27,13 @@
 
 #include <cstddef>
 #include <cstdint>
-#include <cstdio>
 #include <unordered_map>
 #include <vector>
 
 #if defined(MMFREE_ARCH_X86)
 #include <immintrin.h>
-// AVX-512 is used only when the compiler is actually targeting it, so an MMFREE_SIMD=X86 build
-// stays AVX2 and runs on any x86_64. Needs F (masked add/sub, 32-bit compares, reduce), BW
-// (the 16-bit multiply and mask compares TQ1_0's base-3 extraction runs in) and VL (the
-// 256-bit mask compare used for TQ1_0's 16-byte group). tq2 alone would need only F.
-// Enable with MMFREE_SIMD=X86_512 (the runner Makefile / CMake), or any -march that implies
-// both. NOTE -march=native ALONE is not enough to get 512-bit vectors out of auto-vectorized
-// code on skylake-avx512 (GCC defaults to -mprefer-vector-width=256 to dodge the AVX-512
-// downclock), but it IS enough for these explicit intrinsics, which are width-fixed.
+// AVX-512 paths only when the compiler targets F+BW+VL (MMFREE_SIMD=X86_512); an X86 build
+// stays AVX2. TQ1_0's 16-bit extraction needs BW and VL; tq2 alone needs only F.
 #if defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512VL__)
 #define MMFREE_AVX512 1
 #endif
@@ -235,16 +201,9 @@ inline std::int32_t dot_i32(const std::int32_t* x, const std::uint8_t* src, std:
   }
   return vaddvq_s32(vaddq_s32(vaddq_s32(a0, a1), vaddq_s32(a2, a3)));
 #elif defined(MMFREE_ARCH_X86) && defined(MMFREE_AVX512)
-  // NO MULTIPLY, and no trit vectors at all. A ternary product is a CONDITIONAL ADD, so the
-  // 16-bit compares' mask registers drive mask_add / mask_sub on the activations directly.
-  // That removes both the int16->int32 widening and vpmulld — which is 2 uops and ~10 cycle
-  // latency on Skylake, a poor way to multiply by {-1,0,+1}. The first version of this path
-  // did use vpmulld into ONE accumulator and lost to GCC's auto-vectorized scalar loop.
-  //
-  // FOUR accumulators, for the same reason the NEON path has a0..a3: a single acc makes every
-  // add depend on the previous one, and at N=1024 that is a ~60-deep serial chain per output
-  // column that out-of-order execution cannot hide. The negative accumulators are built with
-  // mask_sub from zero, so the four just sum at the end.
+  // No multiply: a ternary product is a conditional add, so the compare masks drive
+  // mask_add / mask_sub on the activations directly (no widening, no vpmulld). Four
+  // accumulators keep the adds off one serial dependency chain.
   __m512i a0 = _mm512_setzero_si512(), a1 = _mm512_setzero_si512();
   __m512i a2 = _mm512_setzero_si512(), a3 = _mm512_setzero_si512();
   std::int32_t tail = 0;
@@ -282,9 +241,7 @@ inline std::int32_t dot_i32(const std::int32_t* x, const std::uint8_t* src, std:
         a3 = _mm512_mask_sub_epi32(a3, neg, a3, xv);
       }
     }
-    // group C is 4 bytes x 4 trits = 16 elements; too narrow to vectorize usefully. Kept in a
-    // scalar accumulator rather than folded into a vector lane — integer addition is
-    // associative, so the total is bit-identical to the other paths' ordering.
+    // group C (16 elements) is too narrow to vectorize; a separate scalar sum is still exact.
     const std::uint8_t* qh = qs + kQsBytes;
     for (std::size_t l = 0; l < 4; ++l)
       for (std::size_t j = 0; j < 4; ++j) tail += trit_at(qh[j], l) * xb[240 + j + 4 * l];
@@ -355,26 +312,10 @@ inline float dot_f32(const float* x, const std::uint8_t* src, std::size_t n) {
 }  // namespace tq1
 
 // =========================================================================================
-// tq2 — the 2-BIT control format.
-//
-// WHY IT EXISTS. The FPGA is swept at two weight encodings (2-bit and 1.6-bit), so the CPU
-// arm needs the same two to make a per-format comparison meaningful. Without this the CPU
-// side only had int8 (8 bits, its native layout) and TQ1_0 (1.625 bits), i.e. no counterpart
-// to the FPGA's 2-bit build.
-//
-// FORMAT: 4 trits per byte, 256 weights -> 64 bytes = EXACTLY 2.0 bits/weight, no remainder
-// group (unlike TQ1_0, since 4 divides 256). Byte j carries the trits for elements
-// j + 64*l, l in [0,4) — the same "l-th slot of a contiguous byte run maps to a contiguous
-// element run" property that makes the extraction vectorize.
-//
-// Extraction is pure shift/mask, no multiply and no wrap trick: t = ((q >> 2l) & 3) - 1.
-// So this is CHEAPER per weight than TQ1_0 while still cutting weight traffic 4x versus int8
-// — which makes it the more interesting of the two packed CPU arms, given the A53 ternary dot
-// turned out to be ALU-bound rather than bandwidth-bound.
-//
-// The encoding is CPU-internal (u = trit + 1, little end first) and deliberately NOT the
-// engine's wire encoding (which uses 0=hold / 1=add / 3=subtract): nothing shares these bytes
-// with the hardware, and a plain base-4 layout keeps the mask constants trivial.
+// tq2 — 2-bit format (the CPU counterpart of the FPGA's 2-bit build). 4 trits per byte,
+// 256 weights -> 64 bytes, exactly 2.0 bits/weight. Byte j holds elements j + 64*l
+// (l in [0,4)) as u = trit + 1 in bits [2l, 2l+2), so extraction is shift/mask only:
+// t = ((q >> 2l) & 3) - 1. CPU-internal; not the engine's 0=hold/1=add/3=sub wire encoding.
 namespace tq2 {
 
 constexpr std::size_t kBlockElems = 256;
@@ -425,15 +366,9 @@ inline Acc dot_scalar(const T* x, const std::uint8_t* src, std::size_t n) {
 }
 
 #if defined(MMFREE_ARCH_ARM)
-// The NEON shift amount must be a compile-time constant, so l is unrolled rather than looped
-// and SH arrives as a template argument.
-//
-// SH=0 (level 0, the low two bits) needs no shift at all, and it must not be written as one:
-// ACLE gives vshrq_n_u8 an immediate range of [1,8], so `vshrq_n_u8(v, 0)` is out of range.
-// GCC accepts it anyway and folds it to a no-op, which is why this compiled on Linux/aarch64;
-// Apple clang enforces the range and rejects it ("argument value 0 is outside of valid range
-// [1,8]"), so an M-series build died here. `if constexpr` keeps the bad call from even being
-// instantiated for SH=0 — a plain `if` would still have to compile it.
+// The NEON shift must be an immediate, so SH is a template argument. SH=0 must never reach
+// vshrq_n_u8: its ACLE range is [1,8] — GCC folds a 0 shift, clang rejects it. `if constexpr`
+// (not a plain `if`) keeps that call from being instantiated at all.
 template <int SH>
 inline int8x16_t tq2_trits(uint8x16_t qv) {
   static_assert(SH >= 0 && SH <= 6 && SH % 2 == 0, "trit level shift is 0/2/4/6");
@@ -449,41 +384,18 @@ inline int8x16_t tq2_trits(uint8x16_t qv) {
 #endif
 
 #if defined(MMFREE_ARCH_X86)
-// x86 counterparts of MMFREE_TQ2_TRITS. Extraction is (q >> 2l) & 3, minus the +1 bias — no
-// multiply and no mod-256 wrap trick, so unlike TQ1_0 this needs no threshold compares. The
-// shift count must be an immediate here too, hence the macro rather than a loop over l.
-// The bytes arrive already widened to int16 lanes so that the -> int32 conversion for the MAC
-// is a straight sign-extend.
+// x86 counterpart of MMFREE_TQ2_TRITS, on bytes already widened to int16 lanes. A macro
+// because the shift count must be an immediate.
 #define MMFREE_TQ2_TRITS_X86(q16, SH)                                              \
   _mm256_sub_epi16(                                                                \
       _mm256_and_si256(_mm256_srli_epi16((q16), (SH)), _mm256_set1_epi16(0x3)),     \
       _mm256_set1_epi16(1))
-#if defined(MMFREE_AVX512)
-#define MMFREE_TQ2_TRITS_512(q16, SH)                                              \
-  _mm512_sub_epi16(                                                                \
-      _mm512_and_si512(_mm512_srli_epi16((q16), (SH)), _mm512_set1_epi16(0x3)),     \
-      _mm512_set1_epi16(1))
-#endif
 #endif
 
-// Inner dim below which the x86 intrinsic paths lose to GCC's auto-vectorized dot_scalar.
-//
-// WHY A THRESHOLD EXISTS. Both x86 paths pay a fixed cost per OUTPUT COLUMN — zeroing four
-// accumulators, then a reduce_add that is several shuffle steps — and amortize it over n/256
-// blocks of work. At n=1024 that is four blocks, and for a projection like 370M's lm_head the
-// cost is paid 32000 times. GCC's scalar loop has less setup to amortize and wins outright.
-//
-// MEASURED end-to-end on a Xeon W-2155 (decode tok/s, 2-bit arm):
-//   n=1024 (370M)  b=1: scalar 90.94, AVX2 61.01, AVX-512 51.70   -> scalar by 43%
-//   n=2048 (1.3B)  b=1: scalar 41.73, AVX2 75.76, AVX-512 92.17   -> AVX-512 by 121%
-// The crossover is somewhere inside that 2x gap, which is why the constant is a round 2048
-// rather than a fitted value — the data cannot place it more precisely than "between", and a
-// tighter number would be false precision.
-//
-// NOT applied to TQ1_0: there the small-n difference measured 97.94 (AVX2) vs 92.07 (AVX-512),
-// which is inside this host's ~11% run-to-run spread, so there is no effect to dispatch on.
-// A batch-aware rule is not possible here — the backend is called once per batch row and only
-// ever sees n.
+// Inner dim below which the x86 intrinsic paths lose to GCC's auto-vectorized dot_scalar:
+// their fixed per-output-column cost (zero accumulators, horizontal reduce) is amortized
+// over only n/256 blocks. The measured crossover lies between n=1024 and n=2048, so this is
+// a bound, not a fitted value. TQ1_0 showed no such effect and does not dispatch on it.
 constexpr std::size_t kX86ScalarBelowN = 2048;
 
 inline std::int32_t dot_i32(const std::int32_t* x, const std::uint8_t* src, std::size_t n) {
@@ -506,13 +418,9 @@ inline std::int32_t dot_i32(const std::int32_t* x, const std::uint8_t* src, std:
   }
   return vaddvq_s32(vaddq_s32(vaddq_s32(a0, a1), vaddq_s32(a2, a3)));
 #elif defined(MMFREE_ARCH_X86) && defined(MMFREE_AVX512)
-  // Extraction happens directly in 32-bit lanes, so the compares yield the __mmask16 that
-  // matches a 16-wide activation load with no widening step at all. trit+1 is 0/1/2, so
-  // trit=+1 <=> v==2 and trit=-1 <=> v==0 — two compares, then a conditional add and a
-  // conditional subtract. No multiply (see the tq1 note on vpmulld) and no int16 stage.
-  // Four accumulators to keep the adds off one dependency chain.
-  //
-  // Needs only AVX512F for the vector work; the 16-bit ops that pull in BW are gone.
+  // Extract in 32-bit lanes so each compare yields a __mmask16 matching a 16-wide activation
+  // load: v==2 (trit +1) -> mask_add, v==0 (trit -1) -> mask_sub. AVX512F only, no multiply;
+  // four accumulators keep the adds off one dependency chain.
   __m512i aP0 = _mm512_setzero_si512(), aN0 = _mm512_setzero_si512();
   __m512i aP1 = _mm512_setzero_si512(), aN1 = _mm512_setzero_si512();
   const std::size_t nb = n / kBlockElems;
@@ -523,8 +431,7 @@ inline std::int32_t dot_i32(const std::int32_t* x, const std::uint8_t* src, std:
     for (std::size_t c = 0; c < 64; c += 16) {
       // 16 bytes -> 16 int32 lanes, reused across all four levels.
       const __m512i q32 = _mm512_cvtepu8_epi32(_mm_loadu_si128((const __m128i*)(q + c)));
-      // Unrolled over l: the shift must be an immediate, and a runtime-indexed vector array
-      // spills to stack (that cost ~38% end-to-end in an earlier version of this path).
+      // Unrolled: the shift must be an immediate, and a runtime-indexed vector array spills.
 #define MMFREE_TQ2_MAC512(SH, L, AP, AN)                                                  \
   do {                                                                                    \
     const __m512i v_ = _mm512_and_si512(_mm512_srli_epi32(q32, SH), k3);                   \
@@ -544,13 +451,8 @@ inline std::int32_t dot_i32(const std::int32_t* x, const std::uint8_t* src, std:
   return _mm512_reduce_add_epi32(_mm512_add_epi32(_mm512_add_epi32(aP0, aN0),
                                                   _mm512_add_epi32(aP1, aN1)));
 #elif defined(MMFREE_ARCH_X86)
-  // AVX2. Until 2026-08-04 x86 had NO hand-written path for this format at all and fell
-  // through to dot_scalar, while the A53 had full NEON — so a CPU-vs-CPU comparison was
-  // measuring GCC's auto-vectorizer against hand-written NEON, not one ISA against the other.
-  // vpsignd, not vpmulld: _mm256_sign_epi32(x, t) negates x where t<0, zeroes it where t==0
-  // and keeps it otherwise — which IS multiplication by a trit, in one cheap uop instead of
-  // vpmulld's two uops and ~10 cycle latency. Four accumulators keep the adds off a single
-  // dependency chain (same reason the NEON path has a0..a3).
+  // AVX2: _mm256_sign_epi32(x, t) is multiplication by a trit in one cheap uop (vs vpmulld).
+  // Four accumulators keep the adds off one dependency chain.
   __m256i acc0 = _mm256_setzero_si256(), acc1 = _mm256_setzero_si256();
   __m256i acc2 = _mm256_setzero_si256(), acc3 = _mm256_setzero_si256();
   const std::size_t nb = n / kBlockElems;
@@ -609,22 +511,7 @@ inline float dot_f32(const float* x, const std::uint8_t* src, std::size_t n) {
 }  // namespace tq2
 
 // ---- backend --------------------------------------------------------------------------
-// Drop-in replacement for CpuBackend that keeps each projection's weights in TQ1_0 form.
-//
-// The packed copy is built lazily on a projection's first matmul and cached, keyed on the
-// `wq` pointer the caller passes. That pointer is a stable address inside the mmap'd
-// model.mmfree and is unique per projection, so nothing else has to be plumbed through
-// bitlinear/Model to make this work. Every projection is touched during the first decode
-// step, so with a warmup run the packing cost never lands in a timed rep.
-//
-// Cost: 1.625/8 of the int8 size as resident heap (370M ~69 MB, 1.3B ~317 MB, 2.7B ~532 MB),
-// against which the int8 mmap pages go cold after packing and become evictable — so for the
-// large models this can lower steady-state RSS rather than raise it.
-//
-// A projection whose N is not a multiple of 256 falls back to the int8 kernel (every real
-// MMfreeLM shape is: 1024 / 2048 / 2560 / 2816 / 5632 / 6912 all divide by 256).
-// Policy structs so one backend serves both packed formats (they differ only in the block
-// geometry and the extraction, never in how the matmul is driven).
+// Format policies, so one PackedBackend drives both packed layouts.
 struct Tq1Format {
   static const char* name() { return "TQ1_0"; }
   static double bits() { return 8.0 * (double)tq1::kBlockBytes / (double)tq1::kBlockElems; }
@@ -651,15 +538,16 @@ struct Tq2Format {
   }
 };
 
+// Drop-in CpuBackend replacement that keeps each projection's weights packed. The packed
+// copy is built on a projection's first matmul and cached, keyed on the `wq` pointer (a
+// stable, per-projection address inside the mmap'd blob), so the cost lands on the first
+// token. A projection whose N is not a multiple of 256 stays on the int8 kernel.
 template <class Fmt>
 struct PackedBackend final : TernaryBackend {
   PackedBackend() = default;
   explicit PackedBackend(std::size_t batch) : batch_(batch ? batch : 1) {}
 
-  // See CpuBackend in ternary_backend.hpp for what batching does and why it is bit-exact.
-  // It matters MORE here than on the int8 path: a packed row is 1.625/2 bits per weight, so
-  // it is likelier to stay resident across the b rows, and these formats exist precisely to
-  // cut weight traffic — batching cuts it again along the other axis.
+  // Batching as in CpuBackend (ternary_backend.hpp): weight row outer, bit-exact.
   std::size_t batch_size() const override { return batch_; }
 
   void matmul(int /*proj_id*/, const std::int32_t* x, std::int32_t* acc,
@@ -716,9 +604,7 @@ struct PackedBackend final : TernaryBackend {
     return cache_.emplace(wq, std::move(buf)).first->second.data();
   }
 
-  // bitlinear invokes the backend from the single model thread (its own parallelism is
-  // internal to each call), so an unsynchronized map is safe here — same assumption the
-  // shared staging buffers in bitlinear.cpp already make.
+  // Unsynchronized: bitlinear calls the backend from the single model thread only.
   std::unordered_map<const std::int8_t*, std::vector<std::uint8_t>> cache_;
   std::size_t bytes_ = 0;
   std::size_t batch_ = 1;

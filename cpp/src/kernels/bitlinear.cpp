@@ -1,4 +1,4 @@
-// bitlinear.cpp — scalar reference fused BitLinear: RMSNorm -> ternary matmul.
+// bitlinear.cpp — fused BitLinear: RMSNorm -> ternary matmul.
 //
 // Float mode: activations are NOT rounded (the triton golden omits it); the projection
 // is a signed float accumulation over ternary lanes, divided by scale_w.
@@ -29,36 +29,27 @@ void bitlinear(float* out, const float* x, const float* norm_weight, const int8_
   const float qs = static_cast<float>(1u << frac_bits);  // 2^frac_bits
   const float inv_fixed = 1.0f / (qs * scale_w);
 
-  // Per-call scratch, reused across calls (bitlinear is invoked serially per projection
-  // by the model thread). thread_local + grow-only avoids a heap alloc + zero-init of
-  // ~12 KB on every projection (144/token) that profiling charged to the CPU front-end.
+  // Grow-only scratch reused across calls (avoids a heap alloc per projection).
   thread_local std::vector<float> y_buf;
   if (y_buf.size() < in_dim) y_buf.resize(in_dim);
   float* y = y_buf.data();  // one row's RMSNorm output (fp32)
 
   if (aq == ActQuant::FixedQ510) {
-    // Batch B rows per backend call: RMSNorm+quant B rows, ONE matmul_batch (the engine
-    // streams the resident weights once and applies them to all B rows — the batching
-    // win), then dequant B rows. B == backend->batch_size(); B==1 (CPU / b=1 bitstream)
-    // and rows<B reduce to the per-row path, and matmul_batch's default loops matmul, so
-    // the CPU result is bit-identical. The integer accumulate is backend-independent, so
-    // the dequant stays bit-identical regardless of B.
+    // B = backend->batch_size() rows per call: RMSNorm+quant B rows, one matmul_batch,
+    // dequant B rows. The integer accumulate is order-independent, so the result is
+    // bit-identical for any B.
     const std::size_t B = std::max<std::size_t>(1, backend->batch_size());
-    // SHARED staging buffers (NOT thread_local): the parallel_rows workers below each
-    // write their own row's slice, and the SERIAL matmul_batch consumes the whole buffer.
-    // thread_local would give each worker its own size-0 copy (resized only on the main
-    // thread) -> out-of-bounds write. Safe as `static` because bitlinear runs on the single
-    // model thread (the parallelism is internal to this call); revisit if bitlinear is ever
-    // made concurrently callable (e.g. a multi-group interleave -> per-group buffers).
+    // SHARED staging buffers, not thread_local: parallel_rows workers each write their own
+    // row slice and the serial matmul_batch reads the whole buffer (a thread_local would be
+    // an unsized per-worker copy). `static` assumes bitlinear is never called concurrently.
     static std::vector<std::int32_t> yqb, accb;
     if (yqb.size() < B * in_dim)  yqb.resize(B * in_dim);    // B rows of fixed-point acts
     if (accb.size() < B * out_dim) accb.resize(B * out_dim);  // B rows of int accumulators
 
     for (std::size_t r0 = 0; r0 < rows; r0 += B) {
       const std::size_t bn = std::min(B, rows - r0);
-      // RMSNorm + quant the bn rows in parallel (rows independent; each row's sumsq
-      // reduction stays serial -> bit-identical to single-threaded). The shared y_buf
-      // can't be used across threads, so each worker uses its own thread_local scratch.
+      // RMSNorm + quant the bn rows in parallel (each row's reduction stays serial), with
+      // per-worker thread_local scratch.
       parallel_rows(bn, [&](std::size_t j) {
         thread_local std::vector<float> ythr;
         if (ythr.size() < in_dim) ythr.resize(in_dim);
@@ -76,13 +67,8 @@ void bitlinear(float* out, const float* x, const float* norm_weight, const int8_
         // bit-exact vs the scalar nearbyint+clamp.
         simd::quant_q510(yqb.data() + j * in_dim, yj, qs, in_dim);
       });
-      // Dequant per COLUMN RANGE rather than after the whole projection. Dequant is
-      // elementwise, so a column range can be finished the moment the backend has it — and
-      // an offloading backend calls back while the engine is still computing the next
-      // range, which puts this work inside the engine's wait window instead of after it.
-      // The default backend fires one callback over [0,M) after the matmul, so the CPU path
-      // is unchanged and the arithmetic is bit-identical either way (each element is scaled
-      // exactly once, order-independent).
+      // Dequant per column range as the backend reports it, so an offloading backend
+      // overlaps it with the next range. Each element is scaled exactly once either way.
       backend->matmul_batch_chunked(
           proj_id, yqb.data(), accb.data(), wq, in_dim, out_dim, bn,
           [&](std::size_t col0, std::size_t ncols) {
@@ -93,9 +79,8 @@ void bitlinear(float* out, const float* x, const float* norm_weight, const int8_
           });
     }
   } else {
-    // Float (triton): signed float accumulation, no activation rounding. Per-row (no
-    // backend / engine offload in this mode); parallel over output rows preserves the
-    // per-row reduction order, so it stays bit-exact vs the scalar reference.
+    // Float (triton): signed float accumulation, no activation rounding, no backend.
+    // Parallel over output rows keeps each dot's reduction order.
     for (std::size_t r = 0; r < rows; ++r) {
       const float* xr = x + r * in_dim;
       float sumsq = simd::sumsq(xr, in_dim);
@@ -130,11 +115,8 @@ void bitlinear_cluster(float* const* outs, const float* x, const float* const* n
   for (std::size_t r0 = 0; r0 < rows; r0 += B) {
     const std::size_t bn = std::min(B, rows - r0);
 
-    // produce(j, xq): RMSNorm(x_row, norm_weights[j]) -> quant -> xq[bn*in_dim].
-    // rstd depends only on x (shared across j), but recomputing it keeps this
-    // bit-identical to bitlinear()'s per-row path and the cost is a NEON reduction.
-    // Row-parallel; per-thread RMSNorm scratch (a shared thread_local can't cross the
-    // worker threads — see rmsnorm_swishgate).
+    // produce(j, xq): RMSNorm(x_row, norm_weights[j]) -> quant -> xq[bn*in_dim]. rstd is
+    // recomputed per j to stay bit-identical to bitlinear(); per-worker scratch.
     auto produce = [&](int j, std::int32_t* xq) {
       parallel_rows(bn, [&](std::size_t i) {
         thread_local std::vector<float> ythr;

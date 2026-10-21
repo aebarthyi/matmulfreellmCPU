@@ -1,5 +1,4 @@
 // bench.cpp — generation-timing harness shared by the CLIs (see mmfree/bench.hpp).
-// Logic lifted verbatim from app/main.cpp's --bench path so timing stays identical.
 #include "mmfree/bench.hpp"
 
 #include "mmfree/profile.hpp"
@@ -46,14 +45,9 @@ BenchResult run_bench(Model& model, const std::vector<std::int64_t>& ids, const 
 
   const std::size_t B = opts.batch > 0 ? opts.batch : 1;
 
-  // One timed generation. Greedy, EOS disabled -> always exactly opts.gen tokens PER STREAM.
-  // The on_token callback timestamps the end of prefill and the last token, splitting prompt
-  // processing from per-token decode. `gen_n` counts tokens across ALL streams.
-  //
-  // Prefill emits exactly one token per stream (generate_serve prefills stream-by-stream, so
-  // those B callbacks arrive staggered and the B-th marks the start of batched decode) — so
-  // the "first token" boundary generalizes from callback 1 to callback B, and at B == 1 it
-  // is the original condition unchanged.
+  // One timed generation: greedy, EOS disabled -> exactly opts.gen tokens per stream.
+  // Prefill emits one token per stream, so the B-th callback marks the end of prefill and
+  // the start of decode. `gen_n` counts tokens across all streams.
   struct RunStat { double prefill_s, decode_s, total_s; std::size_t gen_n; };
   auto run_once = [&]() -> RunStat {
     Sampling g;  // temperature 0 => greedy
@@ -65,8 +59,7 @@ BenchResult run_bench(Model& model, const std::vector<std::int64_t>& ids, const 
       t_last = now;
     };
     if (B == 1) {
-      // Unchanged single-stream path: same call, same callback shape as before batching
-      // existed, so every historical number reproduces exactly.
+      // Single stream: plain generate().
       model.generate(ids, opts.gen, /*eos=*/-1, g, [&](std::int64_t) { tick(); });
     } else {
       std::vector<std::vector<std::int64_t>> prompts(B, ids);
@@ -97,11 +90,9 @@ BenchResult run_bench(Model& model, const std::vector<std::int64_t>& ids, const 
   // reported tok/s. Totals are divided by reps in print_profile -> "per generation".
   if (opts.profile) { Profiler::instance().reset(); Profiler::instance().enable(true); }
 
-  // Throughput is AGGREGATE across streams: (tokens emitted after prefill) / decode time.
-  // At B == 1 that is the historical (gen_n - 1) / decode_s. Per-stream is the same number
-  // divided by B and is printed alongside, because the two answer different questions — a
-  // serving system cares about aggregate, a single user cares about per-stream.
-  double sum_prefill = 0, sum_decode = 0, sum_total = 0, sum_dec_tps = 0;
+  // Decode throughput is AGGREGATE across streams: (tokens after prefill) / decode time;
+  // per-stream (aggregate / B) is printed alongside.
+  double sum_prefill = 0, sum_total = 0, sum_dec_tps = 0;
   for (int i = 0; i < opts.reps; ++i) {
     RunStat s = run_once();
     double dec_tps = (s.gen_n > B && s.decode_s > 0) ? (s.gen_n - B) / s.decode_s : 0.0;
@@ -115,7 +106,6 @@ BenchResult run_bench(Model& model, const std::vector<std::int64_t>& ids, const 
                   i + 1, s.prefill_s * 1e3, dec_tps, overall_tps);
     }
     sum_prefill += s.prefill_s;
-    sum_decode += s.decode_s;
     sum_total += s.total_s;
     sum_dec_tps += dec_tps;
   }
@@ -138,7 +128,6 @@ BenchResult run_bench(Model& model, const std::vector<std::int64_t>& ids, const 
   std::printf("  avg overall: %8.2f tok/s  (%zu gen tokens / %.3f s)\n", overall_tps, gen_toks,
               avg_total);
   if (opts.profile) { Profiler::instance().enable(false); print_profile(opts.reps); }
-  (void)sum_decode;
   return {avg_prefill, avg_dec_tps, overall_tps, prompt_toks, opts.gen, B};
 }
 

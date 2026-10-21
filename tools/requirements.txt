@@ -1,25 +1,12 @@
-# Offline provisioning toolchain — NOT needed to build or run the C++ engine itself
-# (that is pure CMake/C++). `provision.py` downloads an MMfreeLM checkpoint from the HF
-# Hub and packs it into the engine's inputs:
+# Offline provisioning only — the C++ engine needs none of this.
 #   provision.py   HF download + model.mmfree (weights) + tokenizer.mmtok
-#   reference.py   PyTorch quant/reference used by the weight packer
+#   reference.py   PyTorch reference quant used by the default weight packer
 #
-# Imports are lazy, so you only need what your path uses:
-#   --tokenizer-only          stdlib only (nothing here)
-#   --no-torch                numpy + huggingface_hub
-#   default (weight packer)   everything below
-#
-# On a machine where installing torch is the obstacle, `provision.py --no-torch` packs
-# with numpy alone: the ternary weights come out bit-identical, only the per-tensor
-# scale_w floats can shift by 1-2 ULP (see provision.py's docstring). The torch path is
-# the numerics of record — prefer it when reproducing the reference exactly.
-#
-# A CPU-only torch is enough and much smaller than the default CUDA build:
+# Imports are lazy: downloading needs huggingface_hub, `--no-torch` packing only numpy
+# (bit-identical ternary weights, scale_w within 1-2 ULP; torch is the numerics of record),
+# and `--tokenizer-only --skip-download` only the stdlib. A CPU-only torch is enough:
 #   pip install torch --index-url https://download.pytorch.org/whl/cpu
-#
-# The PyTorch/Triton model and the comparison/test tooling were split out — the
-# validation harness (golden-oracle dump, prompt comparison, cpp ctest suite) lives
-# on the `validation` branch, which adds its own extra deps (e.g. transformers).
+# The validation tooling lives on the `validation` branch, with its own extra deps.
 numpy
 huggingface_hub
 safetensors      # used by reference.py (torch path); --no-torch reads the file directly

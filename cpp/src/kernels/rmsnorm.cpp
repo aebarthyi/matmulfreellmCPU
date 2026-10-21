@@ -1,4 +1,4 @@
-// rmsnorm.cpp — scalar reference RMSNorm. fp32 reductions (no -ffast-math reorder).
+// rmsnorm.cpp — RMSNorm with fp32 reductions (no -ffast-math reorder).
 #include "mmfree/kernels.hpp"
 
 #include "mmfree/parallel.hpp"

@@ -1,16 +1,8 @@
-// parallel.hpp — bit-exact CPU threading helpers.
+// parallel.hpp — bit-exact CPU threading helpers (OpenMP; serial without it).
 //
-// The FPGA-offload forward pass is dominated by CPU-side RMSNorm/quant/dequant and
-// the elementwise vector ops (~60% of decode wall time, measured 2026-07-21), and it
-// ran single-threaded. These helpers parallelize that work across the ARM cores.
-//
-// BIT-EXACTNESS CONTRACT (the fixed-point parity gate depends on it): only parallelize
-// over INDEPENDENT rows or over disjoint elementwise ranges. Never split a floating-point
-// reduction (sumsq, dot) across threads — that reorders the summation and changes the
-// result. Each row keeps its own reduction serial, so threaded output is byte-identical
-// to single-threaded (verify with OMP_NUM_THREADS=1 vs N).
-//
-// Without OpenMP the pragmas are ignored and everything stays serial + correct.
+// Bit-exactness contract: parallelize only over INDEPENDENT rows or disjoint elementwise
+// ranges, never across a floating-point reduction (sumsq, dot) — that would reorder the
+// sum. Threaded output is then byte-identical to OMP_NUM_THREADS=1.
 #pragma once
 #include <cstddef>
 

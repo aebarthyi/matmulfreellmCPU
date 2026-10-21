@@ -1,7 +1,7 @@
 // mmfree/tokenizer.hpp — LLaMA SentencePiece-BPE tokenizer (forward-only, no deps).
 //
 // Reproduces the HF `tokenizers` BPE used by MMfreeLM-370M from the data packed by
-// tools/pack_tokenizer.py (tokenizer.mmtok): 32000 pieces + rank-ordered merges,
+// tools/provision.py (tokenizer.mmtok): 32000 pieces + rank-ordered merges,
 // byte_fallback, normalizer {prepend U+2581, ' ' -> U+2581}, no pre-tokenizer split,
 // BOS prepended. Validated id-for-id against HF AutoTokenizer.
 #pragma once

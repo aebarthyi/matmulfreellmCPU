@@ -1,9 +1,9 @@
 // mmfree/weights.hpp — mmap loader for the packed model.mmfree blob.
 //
-// The blob (tools/pack_weights.py) holds ternary weights (int8 {-1,0,+1}) + per-tensor
-// scale_w, per-projection + standalone norm weights, fp32 embeddings, precomputed
-// lower_bounds, final norm and lm_head. Weights are mmap'd and viewed in place -- no
-// copies (the fp32 embeddings + lm_head dominate footprint on the 4 GB board).
+// The blob (tools/provision.py) holds ternary weights (int8 {-1,0,+1}) + per-tensor
+// scale_w for every projection including lm_head, per-projection + standalone norm weights,
+// fp32 embeddings, precomputed lower_bounds and the final norm. Tensors are mmap'd and
+// viewed in place -- no copies.
 #pragma once
 
 #include "mmfree/config.hpp"

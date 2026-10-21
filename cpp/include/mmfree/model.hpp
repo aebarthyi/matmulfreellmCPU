@@ -1,9 +1,5 @@
-// mmfree/model.hpp — HGRN-Bit / MMfreeLM forward-only CPU model.
-//
-// Wires the validated kernels into the full forward: token embedding gather ->
-// per-layer block (attn gated-linear-recurrence + swiglu MLP) over 24 layers ->
-// final RMSNorm -> ternary lm_head -> logits. Batch=1, fp32, no cache (greedy
-// recomputes the prefix each step, mirroring tools/reference.greedy_generate).
+// mmfree/model.hpp — HGRN-Bit / MMfreeLM forward-only CPU model: token embedding ->
+// per-layer block (gated linear recurrence + SwiGLU MLP) -> final RMSNorm -> ternary lm_head.
 #pragma once
 
 #include "mmfree/config.hpp"
@@ -13,6 +9,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <random>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -21,61 +18,73 @@ namespace mmfree {
 
 struct TernaryBackend;  // mmfree/ternary_backend.hpp — pluggable ternary-matmul seam.
 
-// Decoding controls. temperature <= 0 selects greedy argmax (deterministic, the default
-// and the validation path); temperature > 0 enables sampling: logits are scaled by 1/T,
-// optionally restricted to the top_k highest, softmaxed, then sampled with a seeded RNG.
+// Decoding controls. temperature <= 0 is greedy argmax (the default); > 0 samples from
+// softmax(logits / T), optionally restricted to the top_k highest, with a seeded RNG.
 struct Sampling {
   float temperature = 0.0f;     // 0 => greedy
   int top_k = 0;                // <=0 => consider the full vocab
   std::uint64_t seed = 0;       // RNG seed (reproducible when set)
+  float top_p = 1.0f;           // nucleus: sample from the smallest set holding this mass; 1 = off
+  float repeat_penalty = 1.0f;  // >1 discourages tokens among the last repeat_last_n; 1 = off
+  std::size_t repeat_last_n = 64;
+};
+
+// Picks the next token from a logits row per a Sampling: greedy argmax, or temperature /
+// top-k / top-p sampling drawing once from its own seeded RNG per sampled token. The
+// repetition penalty (HF/CTRL semantics: positive logits divided, negative multiplied, once
+// per distinct token) applies to `recent`, the stream's tail, before either.
+class Sampler {
+ public:
+  explicit Sampler(std::uint64_t seed) : rng_(seed) {}
+  std::int64_t operator()(const float* logits, std::size_t vocab, const Sampling& samp,
+                          const std::int64_t* recent = nullptr, std::size_t n_recent = 0);
+
+ private:
+  std::mt19937_64 rng_;
+  std::vector<std::size_t> cand_;
+  std::vector<double> p_;
+  std::vector<float> penalized_;
+  std::vector<std::int64_t> seen_;
 };
 
 class Model {
  public:
-  // `aq` selects the BitLinear activation numerics (Float = triton golden;
-  // FixedQ510 = static 16-bit fixed-point activations into an integer accumulator).
+  // `aq` selects the BitLinear activation numerics (see ActQuant in kernels.hpp).
   explicit Model(const Weights& w, ActQuant aq = ActQuant::Float, int frac_bits = 10);
 
   // Forward over `T` token ids. Writes logits [T, vocab_size] into `logits`.
   void forward(const std::int64_t* ids, std::size_t T, std::vector<float>& logits);
 
-  // Incremental decode (recurrent state carried across steps). Appends up to `new_tokens`
-  // tokens to `ids`, stopping early if `eos_id` is emitted (eos_id < 0 disables it).
-  // `samp` selects greedy (default) or sampling. If `on_token` is set it is called with
-  // each newly generated token id as it is produced (for streaming). Returns the full id
-  // stream.
+  // Incremental decode (recurrent state carried across steps): appends up to `new_tokens`
+  // tokens to `ids`, stopping early on `eos_id` (< 0 disables). `on_token`, if set, streams
+  // each new id. Returns the full id stream.
   std::vector<std::int64_t> generate(const std::vector<std::int64_t>& ids,
                                      std::size_t new_tokens, std::int64_t eos_id = -1,
                                      const Sampling& samp = {},
                                      const std::function<void(std::int64_t)>& on_token = {});
 
-  // Serve B concurrent sequences: prefill each independently (its own recurrent state),
-  // then decode all B in lockstep — ONE batched matmul per projection per step, i.e. B
-  // tokens per weight stream (the spatial-batch throughput win, vs single-stream decode
-  // that re-streams the weights per token). Greedy or per-stream sampling (RNG seeded
-  // samp.seed + stream index). Returns the B full id streams (prompt + generated); a
-  // stream that emits eos_id stops growing but keeps its batch slot. `new_tokens` is the
-  // count generated per stream. With B identical prompts + greedy, all streams must match
-  // each other and a single-stream generate() — the serving correctness check.
-  //
-  // `on_token(stream, id)` (optional) fires as each token is produced, mirroring
-  // generate()'s streaming hook but tagged with the stream it belongs to. Prefill runs
-  // stream-by-stream, so the B first-token callbacks arrive staggered — which is exactly
-  // what a serving TTFT measurement needs: stream 0's fires after one prompt's prefill,
-  // stream B-1's when the whole prefill phase is done and batched decode can start.
-  // Decode steps then fire one callback per live stream per step.
+  // Serve B sequences: prefill each independently (its own recurrent state), then decode
+  // all B in lockstep with one batched matmul per projection per step. `new_tokens` is per
+  // stream; stream b samples with seed samp.seed + b; a stream that emits eos_id stops
+  // growing but keeps its slot. Under greedy each stream matches a separate generate().
+  // `on_token(stream, id)` fires per token; prefill runs stream by stream, so the B
+  // first-token callbacks arrive staggered. Returns the B full id streams.
   std::vector<std::vector<std::int64_t>> generate_serve(
       const std::vector<std::vector<std::int64_t>>& prompts, std::size_t new_tokens,
       std::int64_t eos_id = -1, const Sampling& samp = {},
       const std::function<void(std::size_t, std::int64_t)>& on_token = {});
 
+  // Interactive decoding on one persistent recurrent state. feed() advances it over `T`
+  // tokens (T > 1 is a prefill) and returns the logits [vocab] of the last one;
+  // reset_state() starts a new sequence. generate() is exactly these two plus a Sampler.
+  void reset_state();
+  const std::vector<float>& feed(const std::int64_t* ids, std::size_t T);
+
   const Config& config() const { return cfg_; }
 
-  // Inject a ternary-matmul backend for the BitLinear projections plus a registry mapping
-  // each projection tag (e.g. "model.layers.3.i_proj", "lm_head") to the backend's proj_id.
-  // Default (never called) keeps the built-in CPU path. The backend is borrowed — the
-  // caller owns its lifetime and must outlive the Model. A tag absent from the registry
-  // falls back to the CPU reduction for that projection (proj_id -1).
+  // Inject a ternary-matmul backend plus a registry mapping projection tags (e.g.
+  // "model.layers.3.i_proj", "lm_head") to its proj_ids; an unregistered tag gets -1. The
+  // backend is borrowed and must outlive the Model. Never called = built-in CPU path.
   void set_backend(TernaryBackend* be, std::unordered_map<std::string, int> proj_ids);
 
  private:
@@ -103,8 +112,7 @@ class Model {
   ActQuant aq_;
   int frac_bits_;
 
-  // Ternary-matmul offload (set_backend). nullptr -> built-in CPU reduction; proj_ids_
-  // maps projection tag -> backend proj_id (empty -> all projections fall back to CPU).
+  // set_backend state; nullptr -> built-in CPU reduction.
   TernaryBackend* backend_ = nullptr;
   std::unordered_map<std::string, int> proj_ids_;
 
@@ -113,10 +121,9 @@ class Model {
   std::vector<float> hbuf_, finalnorm_;  // hidden stream + final-norm output
   std::vector<float> hs_, i_, f_, onemf_, scan_, recur_, g_, oin_, oout_, resid_, gate_, y_;
 
-  // Persistent per-layer recurrent state [num_hidden_layers * hidden_size] for incremental
-  // decode in generate(). Lives here (host DRAM); on the FPGA split this is the only
-  // cross-step state, owned by whichever side runs the scan.
+  // Per-layer recurrent state [num_hidden_layers * hidden_size] carried across feed() calls.
   std::vector<float> rstate_;
+  std::vector<float> logits_;  // feed()'s output row [vocab]
 };
 
 }  // namespace mmfree

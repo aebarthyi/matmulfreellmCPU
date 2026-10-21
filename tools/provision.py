@@ -1,35 +1,31 @@
 # -*- coding: utf-8 -*-
 """
-Provision the C++ engine from a Hugging Face checkpoint — one script, all three
-offline steps:
+Provision the C++ engine from a Hugging Face checkpoint, all three offline steps:
 
   1. download the MMfreeLM checkpoint from the HF Hub (weights + tokenizer.json)
-  2. pack the weights   -> cpp/model.mmfree     (ternary quant, baked once)
-  3. pack the tokenizer -> cpp/tokenizer.mmtok  (BPE vocab + merges)
+  2. pack the weights   -> blobs/<size>/model.mmfree     (ternary quant, baked once)
+  3. pack the tokenizer -> blobs/<size>/tokenizer.mmtok  (BPE vocab + merges)
 
-After this, the C++ engine runs with no Python at all (see ../README.md). The
-numerics match tools/reference.py (QUANT_MODE=triton): scale_w = 1/mean(|W|),
-wq = clamp(round(W*scale_w), -1, 1); the C++ side never quantizes weights.
+Afterwards the engine needs no Python. Weight quant matches tools/reference.py:
+scale_w = 1/mean(|W|), wq = clamp(round(W*scale_w), -1, 1); the C++ side never quantizes.
 
 Usage:
   pip install -r tools/requirements.txt
-  python tools/provision.py                                   # ridger/MMfreeLM-370M -> ../cpp
-  python tools/provision.py --model ridger/MMfreeLM-1.3B
-  python tools/provision.py --out-dir /path/to/cpp
+  python tools/provision.py                                   # 370M -> blobs/370M/
+  python tools/provision.py --model 1.3B                      # 370M | 1.3B | 2.7B, or an HF id
+  python tools/provision.py --out-dir /path/to/dir
   python tools/provision.py --skip-download                   # checkpoint already cached
   python tools/provision.py --weights-only | --tokenizer-only # one artifact
   python tools/provision.py --no-torch                        # pack with numpy only
 
-Gated/private repos: run `huggingface-cli login` first (the 370M model is public).
-Imports are lazy, so each path installs only what it uses: `--tokenizer-only` needs the
-stdlib, `--no-torch` needs numpy, the default weight packer needs torch.
+Gated/private repos: run `huggingface-cli login` first (the MMfreeLM models are public).
+Imports are lazy: downloading needs huggingface_hub, the default weight packer torch,
+--no-torch only numpy, and the tokenizer packer only the stdlib.
 
---no-torch trades an exact match for a much smaller dependency: it reads the safetensors
-file directly and does the quant in numpy. Measured on all 145 ternary tensors of
-MMfreeLM-370M, the ternary weights are BIT-IDENTICAL to the torch path; only the
-per-tensor `scale_w` floats can differ in the last 1-2 ULP, because numpy and torch sum
-`mean(|W|)` in a different order. Use the default torch path when reproducing the
-reference numerics exactly; --no-torch when installing torch is the obstacle.
+--no-torch reads the safetensors file directly and quantizes in numpy. The ternary weights
+are bit-identical to the torch path; per-tensor `scale_w` (and `lower_bounds`) can differ
+in the last 1-2 ULP because numpy and torch sum in a different order. The torch path is
+the numerics of record.
 """
 from __future__ import annotations
 
@@ -44,6 +40,18 @@ MMFREE_MAGIC = b"MMFREE1\n"      # weight blob magic (matches cpp/src/io/weights
 MMTOK_MAGIC = b"MMTOK1\n\x00"    # tokenizer magic (matches cpp/src/io/tokenizer.cpp)
 ALIGN = 64
 DEFAULT_MODEL = "ridger/MMfreeLM-370M"
+# The released checkpoints by size: `--model 1.3B` provisions into blobs/1.3B/, which is
+# where `mmfree-cli --model 1.3B` looks.
+SIZES = {"370M": "ridger/MMfreeLM-370M", "1.3B": "ridger/MMfreeLM-1.3B",
+         "2.7B": "ridger/MMfreeLM-2.7B"}
+
+
+def resolve_model(name: str) -> tuple[str, str]:
+    """(HF repo id, blobs/ subdirectory) for a size like "1.3b" or any HF repo id."""
+    for size, repo in SIZES.items():
+        if name.upper() == size or name == repo:
+            return repo, size
+    return name, name.rstrip("/").split("/")[-1]
 
 # the six ternary projections per layer: (blob tag suffix, reference weight key infix)
 LAYER_PROJS = [
@@ -139,10 +147,8 @@ class _NumpyBackend:
         return self._np.ascontiguousarray(self._sd[key], dtype=self._np.float32)
 
     def quant(self, key: str):
-        # Mirrors reference.weight_quant_int: scale = 1/mean(|W|) (clamped), then
-        # round-half-to-even to {-1,0,+1}. np.rint and torch.round are both
-        # round-half-to-even, so the ternary result is identical; only the fp32
-        # summation order inside mean() can differ.
+        # Mirrors reference.weight_quant_int. np.rint and torch.round both round half to
+        # even, so only the fp32 summation order inside mean() can differ.
         np = self._np
         w = self._sd[key]
         scale = np.float32(1.0) / np.maximum(np.abs(w).mean(dtype=np.float32),
@@ -357,9 +363,11 @@ def main() -> int:
     sys.path.insert(0, here)  # so `from reference import ...` resolves in pack_weights
     ap = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--model", default=DEFAULT_MODEL, help="HF repo id (default: %(default)s)")
-    ap.add_argument("--out-dir", default=os.path.join(here, "..", "cpp"),
-                    help="where to write model.mmfree + tokenizer.mmtok (default: ../cpp)")
+    ap.add_argument("--model", default="370M",
+                    help="370M | 1.3B | 2.7B, or any HF repo id (default: %(default)s)")
+    ap.add_argument("--out-dir", default=None,
+                    help="where to write model.mmfree + tokenizer.mmtok "
+                         "(default: blobs/<size>/ at the repo root)")
     ap.add_argument("--skip-download", action="store_true",
                     help="use the already-cached checkpoint")
     ap.add_argument("--weights-only", action="store_true", help="pack only model.mmfree")
@@ -371,7 +379,8 @@ def main() -> int:
     if args.weights_only and args.tokenizer_only:
         ap.error("--weights-only and --tokenizer-only are mutually exclusive")
 
-    out_dir = os.path.abspath(args.out_dir)
+    args.model, subdir = resolve_model(args.model)
+    out_dir = os.path.abspath(args.out_dir or os.path.join(here, "..", "blobs", subdir))
     os.makedirs(out_dir, exist_ok=True)
     do_weights = not args.tokenizer_only
     do_tokenizer = not args.weights_only
@@ -400,8 +409,9 @@ def main() -> int:
     print("\nDone. C++ inputs ready:")
     for r in results:
         print(f"  {r}")
-    print('Build + run:  make && make run PROMPT="hello"'
-          '   (or: cd cpp && cmake -B build && cmake --build build -j)')
+    size = subdir if subdir in SIZES else None
+    print('Build + run:  make && make run' + (f' MODEL={size}' if size else '') +
+          ' PROMPT="hello"   (or: cmake -S cpp -B build && cmake --build build -j)')
     return 0
 
 

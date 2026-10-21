@@ -1,5 +1,5 @@
-// hgrn_model.cpp — HGRN-Bit / MMfreeLM forward, batch=1, fp32.
-// Mirrors tools/reference.py (QUANT_MODE="triton") op-for-op.
+// hgrn_model.cpp — HGRN-Bit / MMfreeLM forward, prefill/decode and batched serving.
+// Mirrors tools/reference.py op-for-op.
 #include "mmfree/model.hpp"
 
 #include "mmfree/kernels.hpp"
@@ -9,7 +9,6 @@
 
 #include <algorithm>
 #include <cmath>
-#include <cstdio>
 #include <random>
 #include <string>
 #include <utility>
@@ -96,10 +95,8 @@ void Model::block(float* h, std::size_t T, std::size_t layer, float* rstate, boo
     rmsnorm(hs_.data(), h, w_.get(p + ".attn_norm.w").f32(), T, H, eps);  // hs
   }
 
-  // i/f/g all read the same post-attn-norm hs (each with its own inner RMSNorm) and have
-  // no engine dependency between them — the only independent projection cluster in the
-  // block. g_proj is hoisted up from below (its result g_ isn't consumed until swishgate,
-  // and nothing between here and there mutates hs_) so the three pipeline as one cluster.
+  // i/f/g read the same hs and are mutually independent, so they run as one cluster.
+  // g_proj is hoisted here: g_ is not consumed until swishgate and hs_ is unchanged until then.
   {
     const std::string cluster_tags[3] = {p + ".i_proj", p + ".f_proj", p + ".g_proj"};
     float* const cluster_outs[3] = {i_.data(), f_.data(), g_.data()};
@@ -237,109 +234,128 @@ const float* Model::layers_and_norm(const std::int64_t* ids, std::size_t T) {
 }
 
 void Model::forward(const std::int64_t* ids, std::size_t T, std::vector<float>& logits) {
-  const std::size_t H = cfg_.hidden_size;
   const std::size_t V = cfg_.vocab_size;
   const float* fn = layers_and_norm(ids, T);
   // lm_head (ternary BitLinear) over all T positions -> logits [T, V]
   logits.assign(T * V, 0.0f);
   run_proj("lm_head", logits.data(), fn, T);
-  (void)H;
+}
+
+std::int64_t Sampler::operator()(const float* lg, std::size_t V, const Sampling& samp,
+                                 const std::int64_t* recent, std::size_t n_recent) {
+  if (samp.repeat_penalty != 1.0f && recent && n_recent) {
+    seen_.assign(recent, recent + n_recent);
+    std::sort(seen_.begin(), seen_.end());
+    seen_.erase(std::unique(seen_.begin(), seen_.end()), seen_.end());
+    penalized_.assign(lg, lg + V);
+    for (std::int64_t id : seen_) {
+      if (id < 0 || static_cast<std::size_t>(id) >= V) continue;
+      float& x = penalized_[static_cast<std::size_t>(id)];
+      x = (x > 0.0f) ? x / samp.repeat_penalty : x * samp.repeat_penalty;
+    }
+    lg = penalized_.data();
+  }
+  if (samp.temperature <= 0.0f) {
+    std::size_t chosen = 0;
+    for (std::size_t v = 1; v < V; ++v)
+      if (lg[v] > lg[chosen]) chosen = v;
+    return static_cast<std::int64_t>(chosen);
+  }
+  cand_.resize(V);
+  for (std::size_t v = 0; v < V; ++v) cand_[v] = v;
+  auto hotter = [&](std::size_t a, std::size_t b) { return lg[a] > lg[b]; };
+  std::size_t k = (samp.top_k > 0 && static_cast<std::size_t>(samp.top_k) < V)
+                      ? static_cast<std::size_t>(samp.top_k)
+                      : V;
+  if (k < V) {
+    std::nth_element(cand_.begin(), cand_.begin() + k, cand_.end(), hotter);
+    cand_.resize(k);
+  }
+  // Softmax over the candidates (temperature-scaled, max-shifted), then sample.
+  float maxl = lg[cand_[0]];
+  for (std::size_t j = 1; j < cand_.size(); ++j) maxl = std::max(maxl, lg[cand_[j]]);
+  double sum = 0.0;
+  p_.resize(cand_.size());
+  for (std::size_t j = 0; j < cand_.size(); ++j) {
+    p_[j] = std::exp((lg[cand_[j]] - maxl) / samp.temperature);
+    sum += p_[j];
+  }
+  if (samp.top_p > 0.0f && samp.top_p < 1.0f) {
+    // Keep the most likely candidates until they hold top_p of the mass (at least one).
+    std::vector<std::size_t> order(cand_.size());
+    for (std::size_t j = 0; j < order.size(); ++j) order[j] = j;
+    std::sort(order.begin(), order.end(), [&](std::size_t a, std::size_t b) {
+      return p_[a] > p_[b] || (p_[a] == p_[b] && cand_[a] < cand_[b]);
+    });
+    std::vector<std::size_t> kept_c;
+    std::vector<double> kept_p;
+    double mass = 0.0;
+    for (std::size_t j : order) {
+      kept_c.push_back(cand_[j]);
+      kept_p.push_back(p_[j]);
+      mass += p_[j];
+      if (mass >= samp.top_p * sum) break;
+    }
+    cand_.swap(kept_c);
+    p_.swap(kept_p);
+    sum = mass;
+  }
+  std::uniform_real_distribution<double> uni(0.0, 1.0);
+  double r = uni(rng_) * sum, acc = 0.0;
+  for (std::size_t j = 0; j < cand_.size(); ++j) {
+    acc += p_[j];
+    if (r <= acc) return static_cast<std::int64_t>(cand_[j]);
+  }
+  return static_cast<std::int64_t>(cand_.back());
+}
+
+void Model::reset_state() { rstate_.assign(cfg_.num_hidden_layers * cfg_.hidden_size, 0.0f); }
+
+// Incremental decode is exact because HGRN's only cross-token channel is the per-layer
+// recurrent state: feeding tokens in pieces replays the same linear recurrence.
+const std::vector<float>& Model::feed(const std::int64_t* ids, std::size_t T) {
+  const std::size_t H = cfg_.hidden_size;
+  const std::size_t L = cfg_.num_hidden_layers;
+  const float* emb = w_.get("model.embeddings").f32();
+  const float* norm_w = w_.get("model.norm.w").f32();
+  if (rstate_.size() != L * H) reset_state();
+
+  ensure_scratch(T);
+  float* h = hbuf_.data();
+  { MMFREE_PROFILE("embed");
+    for (std::size_t t = 0; t < T; ++t) {
+      const float* row = emb + static_cast<std::size_t>(ids[t]) * H;
+      for (std::size_t c = 0; c < H; ++c) h[t * H + c] = row[c];
+    }
+  }
+  for (std::size_t l = 0; l < L; ++l) block(h, T, l, &rstate_[l * H]);
+  { MMFREE_PROFILE("rmsnorm");
+    rmsnorm(finalnorm_.data(), h + (T - 1) * H, norm_w, 1, H, cfg_.rms_norm_eps);
+  }
+  logits_.resize(cfg_.vocab_size);
+  run_proj("lm_head", logits_.data(), finalnorm_.data(), 1);
+  return logits_;
 }
 
 std::vector<std::int64_t> Model::generate(const std::vector<std::int64_t>& ids,
                                           std::size_t new_tokens, std::int64_t eos_id,
                                           const Sampling& samp,
                                           const std::function<void(std::int64_t)>& on_token) {
-  const std::size_t H = cfg_.hidden_size;
-  const std::size_t V = cfg_.vocab_size;
-  const std::size_t L = cfg_.num_hidden_layers;
-  const float eps = cfg_.rms_norm_eps;
-  const float* emb = w_.get("model.embeddings").f32();
-  const float* norm_w = w_.get("model.norm.w").f32();
-
   std::vector<std::int64_t> stream = ids;
-  std::vector<float> last_logits(V);
-
-  std::mt19937_64 rng(samp.seed);
-  std::uniform_real_distribution<double> uni(0.0, 1.0);
-  std::vector<std::size_t> cand;  // candidate indices (reused across steps)
-
-  // Pick the next token from last_logits: greedy argmax (temperature<=0) or
-  // temperature/top-k sampling. Appends it to stream and returns it.
-  auto emit = [&]() -> std::int64_t {
-    std::size_t chosen = 0;
-    if (samp.temperature <= 0.0f) {
-      for (std::size_t v = 1; v < V; ++v)
-        if (last_logits[v] > last_logits[chosen]) chosen = v;
-    } else {
-      cand.resize(V);
-      for (std::size_t v = 0; v < V; ++v) cand[v] = v;
-      auto hotter = [&](std::size_t a, std::size_t b) { return last_logits[a] > last_logits[b]; };
-      std::size_t k = (samp.top_k > 0 && static_cast<std::size_t>(samp.top_k) < V)
-                          ? static_cast<std::size_t>(samp.top_k)
-                          : V;
-      if (k < V) {
-        std::nth_element(cand.begin(), cand.begin() + k, cand.end(), hotter);
-        cand.resize(k);
-      }
-      // Softmax over the candidates (temperature-scaled, max-shifted), then sample.
-      float maxl = last_logits[cand[0]];
-      for (std::size_t j = 1; j < cand.size(); ++j) maxl = std::max(maxl, last_logits[cand[j]]);
-      double sum = 0.0;
-      std::vector<double> p(cand.size());
-      for (std::size_t j = 0; j < cand.size(); ++j) {
-        p[j] = std::exp((last_logits[cand[j]] - maxl) / samp.temperature);
-        sum += p[j];
-      }
-      double r = uni(rng) * sum, acc = 0.0;
-      chosen = cand.back();
-      for (std::size_t j = 0; j < cand.size(); ++j) {
-        acc += p[j];
-        if (r <= acc) { chosen = cand[j]; break; }
-      }
-    }
-    stream.push_back(static_cast<std::int64_t>(chosen));
-    return static_cast<std::int64_t>(chosen);
-  };
-  // RMSNorm + lm_head on a single hidden row -> last_logits.
-  auto head = [&](const float* h_row) {
-    { MMFREE_PROFILE("rmsnorm");
-      rmsnorm(finalnorm_.data(), h_row, norm_w, 1, H, eps);
-    }
-    run_proj("lm_head", last_logits.data(), finalnorm_.data(), 1);
-  };
-
-  // Fresh recurrent state for this generation: each layer starts from zero, then carries
-  // across steps. Incremental decode is exact because HGRN's only cross-token channel is
-  // this state -- recomputing the prefix would just replay the same linear recurrence.
-  rstate_.assign(L * H, 0.0f);
-
-  // ---- prefill: run the whole prompt once, populating per-layer recurrent state ----
-  std::size_t Tp = stream.size();
-  ensure_scratch(Tp);
-  float* h = hbuf_.data();
-  { MMFREE_PROFILE("embed");
-    for (std::size_t t = 0; t < Tp; ++t) {
-      const float* row = emb + static_cast<std::size_t>(stream[t]) * H;
-      for (std::size_t c = 0; c < H; ++c) h[t * H + c] = row[c];
-    }
-  }
-  for (std::size_t l = 0; l < L; ++l) block(h, Tp, l, &rstate_[l * H]);
   if (new_tokens == 0) return stream;
-  head(h + (Tp - 1) * H);  // logits from the last prompt position
-  std::int64_t t = emit();
-  if (on_token) on_token(t);
-  if (t == eos_id) return stream;
-
-  // ---- decode: one new token at a time, carrying the recurrent state (O(1)/step) ----
-  for (std::size_t step = 1; step < new_tokens; ++step) {
-    { MMFREE_PROFILE("embed");
-      const float* row = emb + static_cast<std::size_t>(stream.back()) * H;
-      for (std::size_t c = 0; c < H; ++c) h[c] = row[c];  // single position at h[0..H)
+  Sampler pick(samp.seed);
+  reset_state();
+  const std::vector<float>* lg = &feed(stream.data(), stream.size());  // prefill
+  for (std::size_t step = 0; step < new_tokens; ++step) {
+    if (step > 0) {
+      const std::int64_t last = stream.back();
+      lg = &feed(&last, 1);
     }
-    for (std::size_t l = 0; l < L; ++l) block(h, 1, l, &rstate_[l * H]);
-    head(h);
-    t = emit();
+    const std::size_t from =
+        stream.size() > samp.repeat_last_n ? stream.size() - samp.repeat_last_n : 0;
+    const std::int64_t t =
+        pick(lg->data(), lg->size(), samp, stream.data() + from, stream.size() - from);
+    stream.push_back(t);
     if (on_token) on_token(t);
     if (t == eos_id) break;
   }
@@ -359,51 +375,16 @@ std::vector<std::vector<std::int64_t>> Model::generate_serve(
   const std::size_t B = prompts.size();
 
   std::vector<std::vector<std::int64_t>> streams = prompts;
+  if (new_tokens == 0) return streams;
   // Per-stream recurrent state, layer-major [L][B][H] so layer l's B states are contiguous
   // for the batched decode scan (block stream_state reads rstate as [B, H]).
   std::vector<float> serve_state(L * B * H, 0.0f);
   std::vector<char> done(B, 0);
   std::vector<float> logitsB(B * V);
 
-  std::vector<std::mt19937_64> rng;
-  rng.reserve(B);
-  for (std::size_t b = 0; b < B; ++b) rng.emplace_back(samp.seed + b);
-  std::uniform_real_distribution<double> uni(0.0, 1.0);
-
-  // Pick a token from one logits row [V] (greedy argmax, or temperature/top-k sampling with
-  // this stream's RNG) — mirrors generate()'s emit, per stream.
-  auto sample_row = [&](const float* lg, std::size_t b) -> std::int64_t {
-    if (samp.temperature <= 0.0f) {
-      std::size_t chosen = 0;
-      for (std::size_t v = 1; v < V; ++v)
-        if (lg[v] > lg[chosen]) chosen = v;
-      return static_cast<std::int64_t>(chosen);
-    }
-    std::vector<std::size_t> cand(V);
-    for (std::size_t v = 0; v < V; ++v) cand[v] = v;
-    auto hotter = [&](std::size_t x, std::size_t y) { return lg[x] > lg[y]; };
-    std::size_t k = (samp.top_k > 0 && static_cast<std::size_t>(samp.top_k) < V)
-                        ? static_cast<std::size_t>(samp.top_k)
-                        : V;
-    if (k < V) {
-      std::nth_element(cand.begin(), cand.begin() + k, cand.end(), hotter);
-      cand.resize(k);
-    }
-    float maxl = lg[cand[0]];
-    for (std::size_t j = 1; j < cand.size(); ++j) maxl = std::max(maxl, lg[cand[j]]);
-    double sum = 0.0;
-    std::vector<double> p(cand.size());
-    for (std::size_t j = 0; j < cand.size(); ++j) {
-      p[j] = std::exp((lg[cand[j]] - maxl) / samp.temperature);
-      sum += p[j];
-    }
-    double r = uni(rng[b]) * sum, acc = 0.0;
-    for (std::size_t j = 0; j < cand.size(); ++j) {
-      acc += p[j];
-      if (r <= acc) return static_cast<std::int64_t>(cand[j]);
-    }
-    return static_cast<std::int64_t>(cand.back());
-  };
+  std::vector<Sampler> pick;  // stream b samples with seed samp.seed + b
+  pick.reserve(B);
+  for (std::size_t b = 0; b < B; ++b) pick.emplace_back(samp.seed + b);
 
   std::size_t maxT = B;
   for (const auto& p : prompts) maxT = std::max(maxT, p.size());
@@ -421,7 +402,9 @@ std::vector<std::vector<std::int64_t>> Model::generate_serve(
       block(h, T, l, &serve_state[(l * B + b) * H], /*stream_state=*/false);
     rmsnorm(finalnorm_.data(), h + (T - 1) * H, norm_w, 1, H, eps);
     run_proj("lm_head", logitsB.data(), finalnorm_.data(), 1);
-    std::int64_t t0 = sample_row(logitsB.data(), b);
+    const std::vector<std::int64_t>& sb = streams[b];
+    const std::size_t from = sb.size() > samp.repeat_last_n ? sb.size() - samp.repeat_last_n : 0;
+    std::int64_t t0 = pick[b](logitsB.data(), V, samp, sb.data() + from, sb.size() - from);
     streams[b].push_back(t0);
     if (on_token) on_token(b, t0);
     if (t0 == eos_id) done[b] = 1;
@@ -442,7 +425,11 @@ std::vector<std::vector<std::int64_t>> Model::generate_serve(
     bool all_done = true;
     for (std::size_t b = 0; b < B; ++b) {
       if (done[b]) continue;
-      std::int64_t t = sample_row(logitsB.data() + b * V, b);
+      const std::vector<std::int64_t>& sb = streams[b];
+      const std::size_t from =
+          sb.size() > samp.repeat_last_n ? sb.size() - samp.repeat_last_n : 0;
+      std::int64_t t =
+          pick[b](logitsB.data() + b * V, V, samp, sb.data() + from, sb.size() - from);
       streams[b].push_back(t);
       if (on_token) on_token(b, t);
       if (t == eos_id) done[b] = 1;

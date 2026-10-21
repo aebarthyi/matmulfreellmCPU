@@ -14,14 +14,14 @@ This is the GOLDEN SPEC the C++ CPU port must reproduce. It deliberately:
         (scale_w * scale_a_row) -> matches the float matmul bit-closely and lets the
         C++ assert integer-exactness at the accumulator.
 
-Architectural facts (verified against the checkpoint, June 2026):
+Architectural facts (370M checkpoint):
   hidden=1024, layers=24, heads=1, expand_ratio=1 -> head_dim=1024,
   intermediate=2816 (gate_proj out=5632, down_proj in=2816), vocab=32000,
   use_lower_bound=True, use_short_conv=False.
   lm_head IS a ternary BitLinear (it has lm_head.norm.weight) -- there is no dense GEMM.
 
-Every op optionally records its inputs/outputs into a `Capture` dict so dump_golden.py
-can emit per-op oracles for the C++ unit tests.
+Every op optionally records its inputs/outputs into a `Capture` dict, from which the
+`validation` branch's dump_golden.py emits per-op oracles for the C++ tests.
 """
 from __future__ import annotations
 
@@ -88,7 +88,7 @@ def resolve_checkpoint(model: str = DEFAULT_MODEL) -> str:
     snaps = sorted(glob.glob(cache))
     if not snaps:
         raise FileNotFoundError(
-            f"checkpoint for {model!r} not found locally; run generate.py once to download it."
+            f"checkpoint for {model!r} not found locally; run tools/provision.py once to download it."
         )
     return snaps[-1]
 
@@ -143,19 +143,14 @@ def weight_quant_int(w: torch.Tensor):
 
 
 # Numerics mode for the activation/weight handling inside BitLinear.
-#   "triton"  : faithful to the triton fused kernel actually run by the model --
-#               ternary weights (weight_quant), activations NOT rounded (the kernel
-#               omits .round(), and since scale=127/max|y| the clamp is a no-op, so
-#               activation quant is identity). This is matmul-free (float act x ternary w).
-#   "bitnet"  : textbook BitNet b1.58 / docstring intent -- ternary weights AND per-row
-#               int8-rounded activations, integer accumulator (plan's assumption).
-#   "fullprec": faithful to generate.py as written -- the prepare_for_inference() bug
-#               leaves weights full-precision; NOT matmul-free. (diagnostic only)
-#   "int16"   : 16-bit activations, per-row DYNAMIC scale (block float, like "bitnet"
-#               but 32767 instead of 127). Closest quantized analog to "triton";
-#               integer accumulate over ternary lanes. scale_a = 32767/max|y_row|.
-#   "fixedp"  : 16-bit activations, STATIC Qm.f scale (true fixed point), one global
-#               power-of-2 binary point FIXED_FRAC_BITS for every projection input.
+#   "triton"  : the triton fused kernel the model runs -- ternary weights, activations NOT
+#               rounded (the kernel omits .round() and the clamp is a no-op).
+#   "bitnet"  : textbook BitNet b1.58 -- ternary weights AND per-row int8-rounded
+#               activations, integer accumulator.
+#   "fullprec": full-precision weights; NOT matmul-free (diagnostic only).
+#   "int16"   : 16-bit activations, per-row dynamic scale_a = 32767/max|y_row|.
+#   "fixedp"  : 16-bit activations, one static global binary point FIXED_FRAC_BITS
+#               (true fixed point) -- the C++ FixedQ510 path.
 QUANT_MODE = "triton"
 FIXED_FRAC_BITS = 10  # for "fixedp": signed Q5.10 in int16 -> range +-32, step 2^-10
                       # (global max|y|=16.54 fits; Q.11 -> +-16 would overflow/saturate)

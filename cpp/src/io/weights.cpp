@@ -1,6 +1,6 @@
 // weights.cpp — mmap the model.mmfree blob and build a name->view table.
 //
-// Blob layout (see tools/pack_weights.py):
+// Blob layout (written by tools/provision.py):
 //   [8]  magic "MMFREE1\n"
 //   [8]  u64 header_len (LE)
 //   [hl] header JSON {"config":{...},"tensors":{name:{dtype,shape,offset,nbytes}}}

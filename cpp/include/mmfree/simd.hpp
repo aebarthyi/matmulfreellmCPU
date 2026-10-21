@@ -6,19 +6,15 @@
 //                                       ARMv8.0)
 //   (neither)          -> portable scalar fallback
 //
-// Numerics contract (see kernels.hpp / golden-numerics):
-//   * ternary_dot_i32 (FixedQ510 path) is INTEGER accumulation -> associative ->
-//     BIT-EXACT vs the scalar reference regardless of lane order.
-//   * ternary_dot_f32 / sumsq (fp32) only reorder the summation tree; each ternary
-//     product y*(+-1/0) is itself exact, so the deviation from scalar is pure
-//     reduction-order noise (~1e-6), well under the e2e logit tolerance.
-//   * hgrn_step is elementwise (no reduction) -> bit-exact per lane.
-//   * exp/sigmoid/silu/swiglu use a Cephes single-precision exp polynomial (range
-//     reduction + 6th-order minimax) in place of libm expf. Max relative error
-//     ~1e-7 (under 1 ulp), so the deviation from the libm-based scalar reference is
-//     far below the e2e logit tolerance (the kernel tests check rel_l2<=1e-5 /
-//     max_abs<=1e-4). The scalar tail uses the same polynomial so the vector body
-//     and tail of a single call agree.
+// Numerics contract (see kernels.hpp):
+//   * ternary_dot_i32 (FixedQ510 path) is integer accumulation -> BIT-EXACT vs the scalar
+//     reference regardless of lane order.
+//   * ternary_dot_f32 / sumsq only reorder the fp summation (each ternary product is
+//     exact), so they differ from scalar by reduction-order noise (~1e-6).
+//   * hgrn_step is elementwise -> bit-exact per lane.
+//   * exp/sigmoid/silu/swiglu use a Cephes single-precision exp polynomial instead of libm
+//     expf (max rel. error ~1e-7); the scalar tail uses the same polynomial, so the vector
+//     body and tail of one call agree.
 #pragma once
 
 #include <cmath>
@@ -158,7 +154,6 @@ inline std::int32_t ternary_dot_i32(const std::int32_t* yq, const std::int8_t* w
 // (vcvtnq_s32_f32 / _mm256_cvtps_epi32) use round-to-nearest-ties-to-even, matching
 // nearbyintf under the program's (never-changed) default rounding mode, and the
 // min/max clamp matches the scalar saturation -> BIT-EXACT vs the scalar reference.
-// Replaces a per-element libm nearbyintf call (the dominant FixedQ510 CPU cost).
 inline void quant_q510(std::int32_t* yq, const float* y, float qs, std::size_t n) {
   std::size_t c = 0;
 #if defined(MMFREE_ARCH_X86)

@@ -2,7 +2,6 @@
 #include "mmfree/profile.hpp"
 
 #include <algorithm>
-#include <cstring>
 
 namespace mmfree {
 
